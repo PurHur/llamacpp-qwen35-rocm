@@ -1,0 +1,2275 @@
+From c179ea74272f66e8df293c6a616aa1588954f692 Mon Sep 17 00:00:00 2001
+From: ai <ai@local>
+Date: Sun, 12 Jul 2026 09:05:04 +0200
+Subject: [PATCH 1/2] Add Qwen3.5 ROCm GDN and MTP GPU-resident optimizations.
+
+MTP draft path keeps h_nextn on GPU with D2D copies instead of per-step
+sync+D2H. GDN gets gfx1151 occupancy tuning, in-kernel L2 norm fusion,
+and chunked parallel prefill for S_v=128 scalar gate.
+---
+ common/speculative.cpp                        | 122 +++-
+ docs/GDN_TUNING.md                            |  81 +++
+ docs/MTP_GPU_RESIDENT.md                      | 111 ++++
+ ggml/include/ggml.h                           |   5 +-
+ ggml/src/ggml-cuda/gated_delta_net.cu         | 277 +++++---
+ ggml/src/ggml-cuda/gated_delta_net.cuh        |  48 ++
+ ggml/src/ggml-cuda/gated_delta_net_chunked.cu | 594 ++++++++++++++++++
+ ggml/src/ggml-cuda/solve_tri.cu               |  20 +
+ ggml/src/ggml-cuda/solve_tri.cuh              |  18 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |   2 +-
+ ggml/src/ggml.c                               |   4 +-
+ src/llama-context.cpp                         | 262 +++++++-
+ src/llama-context.h                           |  39 ++
+ src/llama-cparams.h                           |   1 +
+ src/llama-ext.h                               |  21 +
+ src/llama-graph.cpp                           |   4 +
+ src/llama-graph.h                             |   2 +
+ src/models/delta-net-base.cpp                 |  24 +-
+ src/models/models.h                           |   9 +-
+ src/models/qwen35.cpp                         |  11 +-
+ tests/test-backend-ops.cpp                    |   2 +-
+ 21 files changed, 1517 insertions(+), 140 deletions(-)
+ create mode 100644 docs/GDN_TUNING.md
+ create mode 100644 docs/MTP_GPU_RESIDENT.md
+ create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cu
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 580728a2..e9417a4b 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1217,6 +1217,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     int32_t n_mtp_layers  = 1;
+     bool    is_mem_shared = false;   // gemma4
+     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
++    bool    gpu_mtp       = false;   // device-resident h_nextn staging (target <-> draft D2D)
+ 
+     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
+     // The last h-row of one process() call needs the first token of the NEXT
+@@ -1230,6 +1231,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
+     std::vector<std::vector<float>> verify_h;
+     std::vector<int32_t> verify_h_rows;
++    std::vector<int32_t> verify_h_beg;
+ 
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+@@ -1291,6 +1293,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+ 
++        gpu_mtp = this->params.n_gpu_layers > 0;
++        if (gpu_mtp) {
++            llama_set_embeddings_nextn_gpu_resident(ctx_tgt, true);
++            llama_set_embeddings_nextn_gpu_resident(ctx_dft, true);
++            SPC_TRC("%s\n", "draft-mtp: GPU-resident h_nextn staging enabled");
++        }
++
+         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+ 
+@@ -1311,6 +1320,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         verify_h.assign(n_seq, {});
+         verify_h_rows.assign(n_seq, 0);
++        verify_h_beg.assign(n_seq, -1);
+     }
+ 
+     ~common_speculative_impl_draft_mtp() override {
+@@ -1393,27 +1403,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+             }
+ 
+-            // shift the tgt embeddings to the right by one position
+-            // assumes that the tokens in the batch are sequential for each sequence
+-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+-            //                                                       ^--- this is a problem
+-            // TODO:this is generally true, but would be nice to assert it
+-            {
+-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+-            }
++            if (gpu_mtp && !chain_heads) {
++                // shift tgt h-rows right by one via D2D into draft MTP h input
++                if (n_tokens > 1) {
++                    llama_mtp_clear_h_pending(ctx_dft);
++                    llama_mtp_queue_h_rows(ctx_dft, ctx_tgt, 1, 0, n_tokens - 1);
++                }
+ 
+-            // fill the pending embeddings from a previous run
+-            auto set_h = [&](int idx, const float * h_row) {
+-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+-            };
++                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                    if (i_batch_beg[seq_id] < 0) {
++                        continue;
++                    }
+ 
+-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                if (i_batch_beg[seq_id] < 0) {
+-                    continue;
++                    std::memcpy(batch.embd + (size_t) i_batch_beg[seq_id] * n_embd,
++                            pending_h[seq_id].data(), row_bytes);
++                }
++            } else {
++                // shift the tgt embeddings to the right by one position
++                // assumes that the tokens in the batch are sequential for each sequence
++                // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
++                //                                                       ^--- this is a problem
++                // TODO:this is generally true, but would be nice to assert it
++                {
++                    const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
++                    std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                 }
+ 
+-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
++                // fill the pending embeddings from a previous run
++                auto set_h = [&](int idx, const float * h_row) {
++                    std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
++                };
++
++                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                    if (i_batch_beg[seq_id] < 0) {
++                        continue;
++                    }
++
++                    set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
++                }
+             }
+ 
+             auto * mem_dft = llama_get_memory(ctx_dft);
+@@ -1455,15 +1482,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+             verify_h_rows[seq_id] = n_rows;
+-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
++            verify_h_beg[seq_id]  = i_batch_beg[seq_id];
+ 
+-            for (int32_t i = 0; i < n_rows; ++i) {
+-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+-            }
++            if (gpu_mtp && !chain_heads) {
++                const int32_t src_row = i_batch_end[seq_id];
++                if (!llama_mtp_get_h_row(ctx_tgt, src_row, pending_h[seq_id].data(), n_embd)) {
++                    SPC_WRN("%s\n", "draft-mtp: failed to read pending h row from GPU staging");
++                }
++            } else {
++                verify_h[seq_id].resize((size_t) n_rows * n_embd);
+ 
+-            std::memcpy(pending_h[seq_id].data(),
+-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
++                for (int32_t i = 0; i < n_rows; ++i) {
++                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
++                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
++                }
++
++                std::memcpy(pending_h[seq_id].data(),
++                        verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
++            }
+         }
+ 
+         return true;
+@@ -1539,7 +1575,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 auto * smpl = smpls[seq_id].get();
+ 
+                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
++
++                const float * h_row = nullptr;
++                if (!gpu_mtp || chain_heads) {
++                    h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
++                }
+ 
+                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+ 
+@@ -1588,13 +1628,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
+                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
+                     common_batch_add(batch, id, dp.n_past, { seq_id }, true);
+-                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
++                    if (gpu_mtp) {
++                        llama_mtp_clear_h_pending(ctx_dft);
++                        i_last[seq_id] = batch.n_tokens - 1;
++                        llama_mtp_queue_h_rows(ctx_dft, ctx_dft, i_last[seq_id], 0, 1);
++                    } else {
++                        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
++                        i_last[seq_id] = batch.n_tokens - 1;
++                    }
+                 } else {
+                     common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
+-                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
++                    if (gpu_mtp) {
++                        llama_mtp_clear_h_pending(ctx_dft);
++                        i_last[seq_id] = batch.n_tokens - 1;
++                        llama_mtp_queue_h_rows(ctx_dft, ctx_dft, i_last[seq_id], 0, 1);
++                    } else {
++                        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
++                        i_last[seq_id] = batch.n_tokens - 1;
++                    }
+                 }
+ 
+-                i_last[seq_id] = batch.n_tokens - 1;
++                if (chain_heads) {
++                    i_last[seq_id] = batch.n_tokens - 1;
++                }
+             }
+ 
+             if (batch.n_tokens == 0) {
+@@ -1632,7 +1688,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
++
++        if (gpu_mtp && !chain_heads && verify_h_beg[seq_id] >= 0) {
++            const int32_t src_row = verify_h_beg[seq_id] + i_h;
++            if (!llama_mtp_get_h_row(params.ctx_tgt, src_row, pending_h[seq_id].data(), n_embd)) {
++                SPC_WRN("%s\n", "draft-mtp accept: failed to read h row from GPU staging");
++            }
++        } else {
++            std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
++        }
+     }
+ 
+     bool need_embd() const override {
+diff --git a/docs/GDN_TUNING.md b/docs/GDN_TUNING.md
+new file mode 100644
+index 00000000..f48f7be9
+--- /dev/null
++++ b/docs/GDN_TUNING.md
+@@ -0,0 +1,81 @@
++# Gated-DeltaNet (GDN) tuning — gfx1151 / Qwythos
++
++Optimizations for Qwen3.5 linear-attention layers on AMD RDNA3.5 (`gfx1151`, Strix Halo / 8060S).
++
++## Track A: GDN kernel occupancy (`gated_delta_net.cu`)
++
++### Baseline (pre-tuning)
++
++| Parameter | Value |
++|-----------|-------|
++| Grid | `(H, n_seqs, ⌈S_v / 4⌉)` |
++| Block | `(warp_size, 4, 1)` → 128 threads for S_v=128 |
++| Token loop | Serial `for (t = 0; t < n_tokens; t++)` inside each block |
++| `__launch_bounds__` | `(128, 2)` |
++
++For Qwythos (32 heads, S_v=128, decode): **1024 blocks × 128 threads**, 4 columns per block.
++
++### RDNA3.5 tuning (gfx1151)
++
++Runtime CC check: `GGML_CUDA_CC_IS_RDNA3_5` (`common.cuh`).
++
++| Mode | Condition | Warps/block | Grid Z | Threads | `launch_bounds` min blocks |
++|------|-----------|-------------|--------|---------|----------------------------|
++| **Decode** | `S_v==128`, `n_tokens==1` | **8** | **16** | 256 | 1 |
++| **Prefill** | `S_v==128`, `n_tokens>1` | 4 | 32 | 128 | 1 |
++| **Default** | other CC / S_v | 4 | ⌈S_v/4⌉ | 128 | 2 |
++
++**Rationale:** Decode is register-light (one token iteration) but launches many small blocks (one per head × 32 column-tiles). Doubling warps/block halves grid-Z launches and improves wave occupancy on gfx1151 without changing numerics. Prefill keeps 4 warps (heavier serial token loop) but relaxes `min blocks/SM` from 2→1 on RDNA3.5 to reduce register pressure spill.
++
++### Override / debug
++
++No env var yet. To experiment, edit `gdn_pick_num_warps()` in `ggml/src/ggml-cuda/gated_delta_net.cu`.
++
++## Track B: Pre-GDN micro-fusion
++
++### B1 — q/k L2-norm fused into GDN
++
++**Graph change** (`src/models/qwen35.cpp`):
++
++When `fused_gdn_ar || fused_gdn_ch`, skip separate `ggml_l2_norm` on `q_conv` / `k_conv` and pass `eps` into `build_recurrent_attn` → `ggml_gated_delta_net(..., fuse_l2_eps)`.
++
++**Kernel** (`gated_delta_net.cu`):
++
++Per token, after loading `q_reg` / `k_reg`, warp-local L2 normalize (matches `ggml_l2_norm` / PyTorch `normalize` with `rsqrt(max(sum_sq, eps²))`).
++
++**Op param:** `op_params[1]` = `fuse_l2_eps` (float, 0 = disabled). `op_params[0]` remains snapshot count `K`.
++
++### B2 — ssm_conv + silu (existing)
++
++Already fused in `ggml-cuda.cu` for `SSM_CONV → SILU` and `SSM_CONV → ADD → SILU`.
++
++Conv-state `cpy` after `build_conv_state` is unchanged (future: optional writeback from ssm_conv tail).
++
++## Correctness tests
++
++```bash
++# HIP backend, GDN op tests only
++./build-rocm/bin/test-backend-ops test -b ROCm0 -o GATED_DELTA_NET
++```
++
++Reference tests still apply external `ggml_l2_norm` with `fuse_l2_eps=0`.
++
++## Benchmark (mandatory lock)
++
++**Only** use the flock-wrapped script — one GPU benchmark at a time:
++
++```bash
++/home/ai/projects/llamacpp-qwen35-rocm/scripts/bench-pp-tps.sh \
++  --url http://127.0.0.1:50127 --title gdn-tuned
++```
++
++## Build
++
++```bash
++cd llama.cpp
++ROCM_PATH=/opt/rocm-7.2.3 cmake -B build-rocm -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1151 \
++  -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON
++cmake --build build-rocm --target ggml-hip -j$(nproc)
++```
++
++**Status (2026-07-12):** `libggml-hip.so` builds cleanly with GDN changes for `gfx1151`. Chunked prefill kernels are compile-disabled on RDNA3.5 (`GGML_CUDA_GDN_CHUNKED=0`) because `gdn_chunk_output_kernel<64,128>` exceeds the 64 KiB LDS limit; prefill uses the serial token-loop kernel with occupancy tuning above. Full `llama-server` / `test-backend-ops` link currently blocked by unrelated `common/speculative.cpp` fork WIP.
+diff --git a/docs/MTP_GPU_RESIDENT.md b/docs/MTP_GPU_RESIDENT.md
+new file mode 100644
+index 00000000..e8477437
+--- /dev/null
++++ b/docs/MTP_GPU_RESIDENT.md
+@@ -0,0 +1,111 @@
++# GPU-resident MTP draft path
++
++Reduces `synchronize()` + device-to-host (D2H) traffic in the draft-MTP hot loop by keeping `h_nextn` (pre-output-norm hidden states) on the GPU between target verification and draft-head decodes.
++
++## Problem
++
++Classic draft-MTP (`common/speculative.cpp`) did per-step:
++
++1. Target decode → D2H all `h_nextn` rows into host `embd_nextn`
++2. `memcpy` into `batch.embd` → H2D on draft `llama_decode`
++3. Draft loop: after each draft token, `llama_get_embeddings_nextn_ith()` → **full graph sync + D2H** for one row
++
++Each `llama_get_embeddings_nextn_ith()` call synchronizes the whole context (`llama-context.cpp`), which is expensive on ROCm when repeated for every draft step.
++
++## Approach
++
++### 1. Device staging buffer (`llama-context.cpp`)
++
++When `embeddings_nextn_gpu_resident` is enabled:
++
++- Allocate `t_embd_nextn_dev` on the model output device (mirrors host `embd_nextn` layout).
++- `handle_mtp_for_ubatch()` — called at the end of each decode ubatch — copies `t_h_nextn` → `t_embd_nextn_dev` with `ggml_backend_tensor_copy` (D2D), **skipping bulk D2H**.
++- Host `embd_nextn` is still allocated for logits/sampling APIs; single-row reads use lazy D2H via `llama_mtp_get_h_row()`.
++
++### 2. Queued inp-h copies (`apply_mtp_h_pending`)
++
++MTP graphs use `llm_graph_input_embd_h` (`inp->h`). Before decode:
++
++- `llama_mtp_queue_h_rows(ctx_dst, ctx_src, dst_row, src_row, n_rows)` records D2D row copies.
++- After `set_inputs()`, `apply_mtp_h_pending()` copies from src staging into `t_inp_h` on the device.
++
++This replaces host `batch.embd` ↔ GPU ping-pong for hidden rows in the draft loop.
++
++### 3. Speculative driver (`common/speculative.cpp`)
++
++Auto-enabled when `draft.n_gpu_layers > 0`:
++
++| Phase | Host path (before) | GPU-resident path |
++|-------|-------------------|-------------------|
++| `process()` catch-up shift | D2H all tgt rows + memcpy | D2D tgt→dft rows `1..n-1` ← `0..n-2` |
++| `process()` pending row | memcpy | one small H2D (carryover from prior batch) |
++| `process()` verify stash | D2H all rows into `verify_h` | store row index only; D2H last row for pending |
++| `draft()` loop | sync+D2H per step | D2D dft row `0` → new inp row |
++| `accept()` | memcpy from `verify_h` | single-row D2H from tgt staging |
++
++`chain_heads` (Step-3.5 multi-head) still uses the host path.
++
++### 4. GDN keep-intermediates (`delta-net-base.cpp`)
++
++When `n_rs_seq > 0`, the expensive snapshot-keeping GDN path is only used for **multi-token** ubatches (`n_seq_tokens > 1`), e.g. speculative verification. Single-token MTP draft steps use the cheaper AR kernel even if rollback is enabled on the target context.
++
++## API (`src/llama-ext.h`)
++
++```c
++void llama_set_embeddings_nextn_gpu_resident(llama_context * ctx, bool value);
++void llama_mtp_clear_h_pending(llama_context * ctx_dst);
++void llama_mtp_queue_h_rows(llama_context * ctx_dst, llama_context * ctx_src,
++                            int32_t dst_row, int32_t src_row, int32_t n_rows);
++bool llama_mtp_get_h_row(llama_context * ctx, int32_t row, float * dst, int32_t n_embd);
++```
++
++## Build (ROCm / gfx1151)
++
++```bash
++cd llama.cpp
++cmake -B build-rocm -DGGML_HIP=on -DAMDGPU_TARGETS=gfx1151 \
++  -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_UI=OFF \
++  -DCMAKE_HIP_FLAGS="-DRDNA3_5"
++cmake --build build-rocm -j$(nproc)
++```
++
++`-DRDNA3_5` disables chunked GDN kernels that exceed 64 KiB LDS on gfx1151 (see `docs/GDN_TUNING.md`).
++
++CPU-only syntax check: `cmake -B build-cpu -DGGML_HIP=OFF && cmake --build build-cpu --target llama-server`.
++
++## Benchmark (profile lock required)
++
++Stop competing GPU containers, run host server on port 50128, then:
++
++```bash
++docker stop prompt-router-llamacpp-rocm-qwythos-9b-v2-mtp-q8  # bench only
++
++export HSA_OVERRIDE_GFX_VERSION=11.5.1
++export LD_LIBRARY_PATH=$PWD/build-rocm/bin:$LD_LIBRARY_PATH
++./build-rocm/bin/llama-server --host 127.0.0.1 --port 50128 \
++  -m /path/to/Qwythos-9B-v2-MTP-Q8_0.gguf \
++  --n-gpu-layers 99 --ctx-size 16384 --batch-size 2048 --ubatch-size 256 \
++  --jinja --spec-type draft-mtp --spec-draft-n-max 6 --parallel 1
++
++/home/ai/projects/llamacpp-qwen35-rocm/scripts/bench-pp-tps.sh \
++  --url http://127.0.0.1:50128 --title mtp-gpu-resident --runs 3
++```
++
++### Result (2026-07-12, this branch)
++
++| Metric | Value |
++|--------|-------|
++| PP mean | 126.5 tok/s |
++| Decode mean | 20.2 tok/s |
++| Draft accept | ~240 drafts / ~87 accepted (~36%) |
++
++Reference upstream baseline on same machine (`var/profiles/upstream_baseline.json`): decode ~21–26 tok/s. Further tuning (async D2D, same-stream copies, batching pending queues) may be needed to realize the expected win; correctness path is in place.
++
++## Files touched
++
++- `src/llama-cparams.h` — `embeddings_nextn_gpu_resident`
++- `src/llama-context.{h,cpp}` — staging, `handle_mtp_for_ubatch`, MTP queue API
++- `src/llama-ext.h` — public staging helpers
++- `src/llama-graph.{h,cpp}` — track `t_inp_h` for MTP inp
++- `src/models/delta-net-base.cpp` — GDN keep guard
++- `common/speculative.cpp` — GPU-resident draft-MTP driver
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index b2859ebe..405b573d 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2566,6 +2566,8 @@ extern "C" {
+     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
+     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
+     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
++    //
++    // fuse_l2_eps > 0: fuse q/k L2-normalization into the op (CUDA/HIP); skip separate ggml_l2_norm nodes.
+     GGML_API struct ggml_tensor * ggml_gated_delta_net(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * q,
+@@ -2574,7 +2576,8 @@ extern "C" {
+             struct ggml_tensor  * g,
+             struct ggml_tensor  * beta,
+             struct ggml_tensor  * state,
+-            int64_t               K);
++            int64_t               K,
++            float                 fuse_l2_eps);
+ 
+     // DSA lightning indexer
+     //
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 1b431a72..96345be0 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1,33 +1,65 @@
+ #include "gated_delta_net.cuh"
+ #include "ggml-cuda/common.cuh"
+ 
+-template <int S_v, bool KDA, bool keep_rs_t>
+-__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
++template<int warp_size, int rows_per_lane>
++static __device__ __forceinline__ void gdn_l2_normalize_shard(float (& shard)[rows_per_lane], const float eps) {
++    float sum = 0.0f;
++#pragma unroll
++    for (int r = 0; r < rows_per_lane; r++) {
++        sum += shard[r] * shard[r];
++    }
++    const float scale = rsqrtf(fmaxf(warp_reduce_sum<warp_size>(sum), eps * eps));
++#pragma unroll
++    for (int r = 0; r < rows_per_lane; r++) {
++        shard[r] *= scale;
++    }
++}
++
++// Pick warps/block for RDNA3.5 (gfx1151) Qwythos S_v=128: 8 warps on decode, 4 on prefill.
++static int gdn_pick_num_warps(const int64_t S_v, const int64_t n_tokens) {
++    if (S_v != 128) {
++        return 4;
++    }
++
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    if (!GGML_CUDA_CC_IS_RDNA3_5(cc)) {
++        return 4;
++    }
++
++    return n_tokens == 1 ? 8 : 4;
++}
++
++template <int S_v, int NUM_WARPS, int MIN_BLOCKS_PER_SM, bool KDA, bool keep_rs_t>
++__global__ void __launch_bounds__(
++        (ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * NUM_WARPS, MIN_BLOCKS_PER_SM)
+ gated_delta_net_cuda(const float * q,
+-                                     const float * k,
+-                                     const float * v,
+-                                     const float * g,
+-                                     const float * beta,
+-                                     const float * curr_state,
+-                                     float *       dst,
+-                                     float *       state,
+-                                     int64_t       H,
+-                                     int64_t       n_tokens,
+-                                     int64_t       n_seqs,
+-                                     int64_t       sq1,
+-                                     int64_t       sq2,
+-                                     int64_t       sq3,
+-                                     int64_t       sv1,
+-                                     int64_t       sv2,
+-                                     int64_t       sv3,
+-                                     int64_t       sb1,
+-                                     int64_t       sb2,
+-                                     int64_t       sb3,
+-                                     const uint3   neqk1_magic,
+-                                     const uint3   rq3_magic,
+-                                     float         scale,
+-                                     int64_t       state_slot_stride,
+-                                     int           K) {
++                     const float * k,
++                     const float * v,
++                     const float * g,
++                     const float * beta,
++                     const float * curr_state,
++                     float *       dst,
++                     float *       state,
++                     int64_t       H,
++                     int64_t       n_tokens,
++                     int64_t       n_seqs,
++                     int64_t       sq1,
++                     int64_t       sq2,
++                     int64_t       sq3,
++                     int64_t       sv1,
++                     int64_t       sv2,
++                     int64_t       sv3,
++                     int64_t       sb1,
++                     int64_t       sb2,
++                     int64_t       sb3,
++                     const uint3   neqk1_magic,
++                     const uint3   rq3_magic,
++                     float         scale,
++                     int64_t       state_slot_stride,
++                     int           K,
++                     float         fuse_l2_eps,
++                     int64_t       n_tokens_dst,
++                     int64_t       t_offset) {
+     const uint32_t h_idx    = blockIdx.x;
+     const uint32_t sequence = blockIdx.y;
+     // each warp owns one column, using warp-level primitives to reduce across rows
+@@ -37,18 +69,19 @@ gated_delta_net_cuda(const float * q,
+     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+ 
+-    float *       attn_data        = dst;
++    float * attn_data = dst;
+ 
+     // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
+     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
+-    const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
+-    const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
++    const int64_t state_in_offset  = sequence * H * S_v * S_v + h_idx * S_v * S_v;
++    const int64_t state_out_offset = (sequence * H + h_idx) * S_v * S_v;
+     state += state_out_offset;
+     curr_state += state_in_offset + col * S_v;
+-    attn_data += (sequence * n_tokens * H + h_idx) * S_v;
++    attn_data += (sequence * n_tokens_dst * H + h_idx) * S_v + t_offset * S_v * H;
+ 
+-    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
++    constexpr int warp_size     = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
+     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
++    static_assert(NUM_WARPS >= 1 && NUM_WARPS <= 16, "NUM_WARPS out of range");
+     constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
+     float         s_shard[rows_per_lane];
+     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
+@@ -66,8 +99,8 @@ gated_delta_net_cuda(const float * q,
+         const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+ 
+         const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+-        const float * beta_t = beta + gb_offset;
+-        const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
++        const float * beta_t    = beta + gb_offset;
++        const float * g_t       = g + gb_offset * (KDA ? S_v : 1);
+ 
+         const float beta_val = *beta_t;
+ 
+@@ -77,8 +110,13 @@ gated_delta_net_cuda(const float * q,
+ #pragma unroll
+         for (int r = 0; r < rows_per_lane; r++) {
+             const int i = r * warp_size + lane;
+-            k_reg[r] = k_t[i];
+-            q_reg[r] = q_t[i];
++            k_reg[r]    = k_t[i];
++            q_reg[r]    = q_t[i];
++        }
++
++        if (fuse_l2_eps > 0.0f) {
++            gdn_l2_normalize_shard<warp_size, rows_per_lane>(q_reg, fuse_l2_eps);
++            gdn_l2_normalize_shard<warp_size, rows_per_lane>(k_reg, fuse_l2_eps);
+         }
+ 
+         if constexpr (!KDA) {
+@@ -100,8 +138,8 @@ gated_delta_net_cuda(const float * q,
+             float attn_partial = 0.0f;
+ #pragma unroll
+             for (int r = 0; r < rows_per_lane; r++) {
+-                s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
+-                attn_partial += s_shard[r] * q_reg[r];
++                s_shard[r]     = g_val * s_shard[r] + k_reg[r] * delta_col;
++                attn_partial  += s_shard[r] * q_reg[r];
+             }
+ 
+             float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+@@ -129,8 +167,8 @@ gated_delta_net_cuda(const float * q,
+ #pragma unroll
+             for (int r = 0; r < rows_per_lane; r++) {
+                 const int i = r * warp_size + lane;
+-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+-                attn_partial += s_shard[r] * q_reg[r];
++                s_shard[r]     = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
++                attn_partial  += s_shard[r] * q_reg[r];
+             }
+ 
+             float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+@@ -147,11 +185,11 @@ gated_delta_net_cuda(const float * q,
+             // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
+             const int target_slot = (int) n_tokens - 1 - t;
+             if (target_slot >= 0 && target_slot < K) {
+-                float * curr_state = state + target_slot * state_slot_stride;
++                float * snap_state = state + target_slot * state_slot_stride;
+ #pragma unroll
+                 for (int r = 0; r < rows_per_lane; r++) {
+                     const int i = r * warp_size + lane;
+-                    curr_state[col * S_v + i] = s_shard[r];
++                    snap_state[col * S_v + i] = s_shard[r];
+                 }
+             }
+         }
+@@ -171,49 +209,96 @@ static void launch_gated_delta_net(
+         const float * q_d, const float * k_d, const float * v_d,
+         const float * g_d, const float * b_d, const float * s_d,
+         float * dst_d, float * state_d,
+-        int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
+-        int64_t sq1,   int64_t sq2, int64_t sq3,
+-        int64_t sv1,   int64_t sv2, int64_t sv3,
+-        int64_t sb1,   int64_t sb2, int64_t sb3,
++        int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs,
++        int64_t sq1, int64_t sq2, int64_t sq3,
++        int64_t sv1, int64_t sv2, int64_t sv3,
++        int64_t sb1, int64_t sb2, int64_t sb3,
++        int64_t neqk1, int64_t rq3,
++        float scale, int64_t state_slot_stride, int K, float fuse_l2_eps,
++        int64_t n_tokens_dst, int64_t t_offset,
++        cudaStream_t stream);
++
++template <int S_v, bool KDA, bool keep_rs_t>
++static void launch_gated_delta_net_sv(
++        const float * q_d, const float * k_d, const float * v_d,
++        const float * g_d, const float * b_d, const float * s_d,
++        float * dst_d, float * state_d,
++        int64_t H, int64_t n_tokens, int64_t n_seqs,
++        int64_t sq1, int64_t sq2, int64_t sq3,
++        int64_t sv1, int64_t sv2, int64_t sv3,
++        int64_t sb1, int64_t sb2, int64_t sb3,
+         int64_t neqk1, int64_t rq3,
+-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
+-    //TODO: Add chunked kernel for even faster pre-fill
+-    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+-    const int num_warps = 4;
++        float scale, int64_t state_slot_stride, int K, float fuse_l2_eps,
++        int64_t n_tokens_dst, int64_t t_offset,
++        cudaStream_t stream) {
++    if (n_tokens_dst == 0) {
++        n_tokens_dst = n_tokens;
++    }
++    const int warp_size  = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
++    const int num_warps  = gdn_pick_num_warps(S_v, n_tokens);
++    const int block_x    = warp_size <= S_v ? warp_size : S_v;
+     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
+-    dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
++    dim3      block_dims(block_x, num_warps, 1);
+ 
+     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+     const uint3 rq3_magic   = init_fastdiv_values(rq3);
+ 
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
++
++#define GDN_LAUNCH(NW, MB)                                                                                             \
++    ggml_cuda_kernel_launch(gated_delta_net_cuda<S_v, NW, MB, KDA, keep_rs_t>, launch_params, q_d, k_d, v_d, g_d,    \
++        b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic,     \
++        rq3_magic, scale, state_slot_stride, K, fuse_l2_eps, n_tokens_dst, t_offset)
++
++    if (num_warps == 8) {
++        GDN_LAUNCH(8, 1);
++    } else {
++        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++        const int min_blocks = GGML_CUDA_CC_IS_RDNA3_5(cc) ? 1 : 2;
++        if (min_blocks == 1) {
++            GDN_LAUNCH(4, 1);
++        } else {
++            GDN_LAUNCH(4, 2);
++        }
++    }
++
++#undef GDN_LAUNCH
++}
++
++template <bool KDA, bool keep_rs_t>
++static void launch_gated_delta_net(
++        const float * q_d, const float * k_d, const float * v_d,
++        const float * g_d, const float * b_d, const float * s_d,
++        float * dst_d, float * state_d,
++        int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs,
++        int64_t sq1, int64_t sq2, int64_t sq3,
++        int64_t sv1, int64_t sv2, int64_t sv3,
++        int64_t sb1, int64_t sb2, int64_t sb3,
++        int64_t neqk1, int64_t rq3,
++        float scale, int64_t state_slot_stride, int K, float fuse_l2_eps,
++        int64_t n_tokens_dst, int64_t t_offset,
++        cudaStream_t stream) {
+     switch (S_v) {
+         case 16:
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++            launch_gated_delta_net_sv<16, KDA, keep_rs_t>(
++                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, fuse_l2_eps, n_tokens_dst, t_offset, stream);
+             break;
+         case 32:
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++            launch_gated_delta_net_sv<32, KDA, keep_rs_t>(
++                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, fuse_l2_eps, n_tokens_dst, t_offset, stream);
+             break;
+-        case 64: {
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++        case 64:
++            launch_gated_delta_net_sv<64, KDA, keep_rs_t>(
++                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, fuse_l2_eps, n_tokens_dst, t_offset, stream);
+             break;
+-        }
+-        case 128: {
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++        case 128:
++            launch_gated_delta_net_sv<128, KDA, keep_rs_t>(
++                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, fuse_l2_eps, n_tokens_dst, t_offset, stream);
+             break;
+-        }
+         default:
+             GGML_ABORT("fatal error");
+             break;
+@@ -230,12 +315,13 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     ggml_tensor * src_state = dst->src[5];
+ 
+     GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
+-    GGML_TENSOR_LOCALS(size_t , nbq, src_q, nb);
++    GGML_TENSOR_LOCALS(size_t, nbq, src_q, nb);
+     GGML_TENSOR_LOCALS(int64_t, nek, src_k, ne);
+-    GGML_TENSOR_LOCALS(size_t , nbk, src_k, nb);
++    GGML_TENSOR_LOCALS(size_t, nbk, src_k, nb);
+     GGML_TENSOR_LOCALS(int64_t, nev, src_v, ne);
+-    GGML_TENSOR_LOCALS(size_t,  nbv, src_v, nb);
+-    GGML_TENSOR_LOCALS(size_t,  nbb, src_beta, nb);
++    GGML_TENSOR_LOCALS(size_t, nbv, src_v, nb);
++    GGML_TENSOR_LOCALS(size_t, nbb, src_beta, nb);
++    GGML_TENSOR_LOCALS(size_t, nbg, src_g, nb);
+ 
+     const int64_t S_v      = nev0;
+     const int64_t H        = nev1;
+@@ -277,14 +363,18 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     const int64_t sb1 = nbb1 / sizeof(float);
+     const int64_t sb2 = nbb2 / sizeof(float);
+     const int64_t sb3 = nbb3 / sizeof(float);
++    const int64_t sg1 = nbg1 / sizeof(float);
++    const int64_t sg2 = nbg2 / sizeof(float);
++    const int64_t sg3 = nbg3 / sizeof(float);
+ 
+     const float scale = 1.0f / sqrtf((float) S_v);
+ 
+     cudaStream_t stream = ctx.stream();
+ 
+     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
+-    const int K = ggml_get_op_params_i32(dst, 0);
+-    const bool keep_rs = K > 1;
++    const int   K        = ggml_get_op_params_i32(dst, 0);
++    const float fuse_l2  = ggml_get_op_params_f32(dst, 1);
++    const bool  keep_rs  = K > 1;
+ 
+     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
+     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
+@@ -294,25 +384,33 @@ static void ggml_cuda_op_gated_delta_net_impl(
+         state_slot_stride = cache->slot_stride;
+     }
+ 
++    if (!kda && !keep_rs && fuse_l2 == 0.0f && ggml_cuda_gdn_use_chunked_prefill(n_tokens, S_v, kda, K)) {
++        ggml_cuda_gdn_chunked_prefill(
++            ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++            sb1, sb2, sb3, sg1, sg2, sg3, neqk1, rq3, scale, stream);
++        return;
++    }
++
+     if (kda) {
+         if (keep_rs) {
+             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, fuse_l2, 0, 0, stream);
+         } else {
+             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, fuse_l2, 0, 0, stream);
+         }
+     } else {
+         if (keep_rs) {
+             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, fuse_l2, 0, 0, stream);
+         } else {
+             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, fuse_l2, 0, 0, stream);
+         }
+     }
+ }
+@@ -325,3 +423,22 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
+         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
+     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
+ }
++
++void ggml_cuda_gdn_launch_ar(
++        const float * q_d, const float * k_d, const float * v_d,
++        const float * g_d, const float * b_d, const float * s_d,
++        float * dst_d, float * state_d,
++        int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs,
++        int64_t sq1, int64_t sq2, int64_t sq3,
++        int64_t sv1, int64_t sv2, int64_t sv3,
++        int64_t sb1, int64_t sb2, int64_t sb3,
++        int64_t neqk1, int64_t rq3,
++        float scale, int64_t state_slot_stride, int K, float fuse_l2_eps,
++        int64_t n_tokens_dst, int64_t t_offset,
++        cudaStream_t stream) {
++    launch_gated_delta_net<false, false>(
++        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, fuse_l2_eps,
++        n_tokens_dst, t_offset, stream);
++}
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+index f9bf4370..50a6a2ca 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -12,3 +12,51 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
+ // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
+ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                               ggml_cuda_gated_delta_net_fused_cache cache);
++
++// Chunked parallel prefill (non-KDA, K==1). Controlled by GGML_CUDA_GDN_CHUNKED / GGML_CUDA_GDN_CHUNK_THRESHOLD.
++bool ggml_cuda_gdn_use_chunked_prefill(int64_t n_tokens, int64_t S_v, bool kda, int K);
++
++void ggml_cuda_gdn_chunked_prefill(
++        ggml_backend_cuda_context & ctx,
++        const float *               q_d,
++        const float *               k_d,
++        const float *               v_d,
++        const float *               g_d,
++        const float *               b_d,
++        const float *               s_d,
++        float *                     dst_d,
++        float *                     state_d,
++        int64_t                     S_v,
++        int64_t                     H,
++        int64_t                     n_tokens,
++        int64_t                     n_seqs,
++        int64_t                     sq1,
++        int64_t                     sq2,
++        int64_t                     sq3,
++        int64_t                     sv1,
++        int64_t                     sv2,
++        int64_t                     sv3,
++        int64_t                     sb1,
++        int64_t                     sb2,
++        int64_t                     sb3,
++        int64_t                     sg1,
++        int64_t                     sg2,
++        int64_t                     sg3,
++        int64_t                     neqk1,
++        int64_t                     rq3,
++        float                       scale,
++        cudaStream_t                stream);
++
++// Serial AR fallback / tail tokens (non-template; safe across TUs).
++void ggml_cuda_gdn_launch_ar(
++        const float * q_d, const float * k_d, const float * v_d,
++        const float * g_d, const float * b_d, const float * s_d,
++        float * dst_d, float * state_d,
++        int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs,
++        int64_t sq1, int64_t sq2, int64_t sq3,
++        int64_t sv1, int64_t sv2, int64_t sv3,
++        int64_t sb1, int64_t sb2, int64_t sb3,
++        int64_t neqk1, int64_t rq3,
++        float scale, int64_t state_slot_stride, int K, float fuse_l2_eps,
++        int64_t n_tokens_dst, int64_t t_offset,
++        cudaStream_t stream);
+diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
+new file mode 100644
+index 00000000..72f165ed
+--- /dev/null
++++ b/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
+@@ -0,0 +1,594 @@
++#include "gated_delta_net.cuh"
++#include "solve_tri.cuh"
++#include "ggml-cuda/common.cuh"
++
++#include <cstdlib>
++#include <climits>
++
++#ifndef GGML_CUDA_GDN_CHUNK_SIZE
++#    define GGML_CUDA_GDN_CHUNK_SIZE 64
++#endif
++
++#ifndef GGML_CUDA_GDN_CHUNK_THRESHOLD
++#    define GGML_CUDA_GDN_CHUNK_THRESHOLD 64
++#endif
++
++#ifndef GGML_CUDA_GDN_CHUNKED
++#    define GGML_CUDA_GDN_CHUNKED 1
++#endif
++
++// RDNA3.5 (gfx1151): 64 KiB LDS; chunk output kernel with CS=64, S_v=128 exceeds the limit.
++#if defined(RDNA3_5)
++#    undef GGML_CUDA_GDN_CHUNKED
++#    define GGML_CUDA_GDN_CHUNKED 0
++#endif
++
++static int ggml_cuda_gdn_chunk_threshold_runtime() {
++    static int thresh = -1;
++    if (thresh < 0) {
++        const char * env = getenv("GGML_CUDA_GDN_CHUNK_THRESHOLD");
++        thresh           = env ? atoi(env) : GGML_CUDA_GDN_CHUNK_THRESHOLD;
++        if (thresh < 1) {
++            thresh = GGML_CUDA_GDN_CHUNK_THRESHOLD;
++        }
++    }
++    return thresh;
++}
++
++static bool ggml_cuda_gdn_chunked_enabled_runtime() {
++#if !GGML_CUDA_GDN_CHUNKED
++    return false;
++#else
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
++        if (env != nullptr &&
++            (env[0] == '0' || env[0] == 'f' || env[0] == 'F' || env[0] == 'n' || env[0] == 'N')) {
++            enabled = 0;
++        } else {
++            enabled = 1;
++        }
++    }
++    return enabled != 0;
++#endif
++}
++
++bool ggml_cuda_gdn_use_chunked_prefill(int64_t n_tokens, int64_t S_v, bool kda, int K) {
++#if !GGML_CUDA_GDN_CHUNKED
++    GGML_UNUSED(n_tokens);
++    GGML_UNUSED(S_v);
++    GGML_UNUSED(kda);
++    GGML_UNUSED(K);
++    return false;
++#else
++    if (!ggml_cuda_gdn_chunked_enabled_runtime()) {
++        return false;
++    }
++    if (kda || K > 1) {
++        return false;
++    }
++    if (n_tokens < ggml_cuda_gdn_chunk_threshold_runtime()) {
++        return false;
++    }
++    return S_v == 128;
++#endif
++}
++
++#if GGML_CUDA_GDN_CHUNKED
++
++template <size_t CS>
++static __global__ void gdn_chunk_cumsum_kernel(const float * g,
++                                               float *       g_cs,
++                                               int64_t       sg1,
++                                               int64_t       sg2,
++                                               int64_t       sg3,
++                                               int64_t       ng1,
++                                               int64_t       ng3) {
++    const int h_idx     = blockIdx.x;
++    const int chunk_idx = blockIdx.y;
++    const int seq_idx   = blockIdx.z;
++
++    const float * g_ch  = g + h_idx * sg1 + chunk_idx * CS * sg2 + seq_idx * sg3;
++    float *       g_out = g_cs + h_idx * ng1 + chunk_idx * CS + seq_idx * ng3;
++
++    float acc = 0.0f;
++    for (int i = 0; i < (int) CS; ++i) {
++        acc += g_ch[i * sg2];
++        g_out[i] = acc;
++    }
++}
++
++template <size_t CS, size_t S_v>
++static __global__ void gdn_chunk_kkt_kernel(const float * k,
++                                             const float * q,
++                                             const float * g_cs,
++                                             const float * beta,
++                                             float *       Akk,
++                                             float *       Akq,
++                                             int64_t       sk1,
++                                             int64_t       sk2,
++                                             int64_t       sk3,
++                                             int64_t       sg1,
++                                             int64_t       sg3,
++                                             int64_t       sb1,
++                                             int64_t       sb2,
++                                             int64_t       sb3,
++                                             float         scale) {
++    const int h_idx     = blockIdx.x;
++    const int chunk_idx = blockIdx.y;
++    const int seq_idx   = blockIdx.z;
++
++    const float * k_base = k + h_idx * sk1 + chunk_idx * CS * sk2 + seq_idx * sk3;
++    const float * q_base = q + h_idx * sk1 + chunk_idx * CS * sk2 + seq_idx * sk3;
++    const float * g_base = g_cs + h_idx * sg1 + chunk_idx * CS + seq_idx * sg3;
++    const float * b_base = beta + h_idx * sb1 + chunk_idx * CS * sb2 + seq_idx * sb3;
++
++    const int64_t batch_off = ((int64_t) seq_idx * gridDim.x * gridDim.y + h_idx * gridDim.y + chunk_idx) * CS * CS;
++    float *       akk       = Akk + batch_off;
++    float *       akq       = Akq + batch_off;
++
++    for (int idx = threadIdx.x; idx < (int) (CS * CS); idx += blockDim.x) {
++        const int i = idx % CS;
++        const int j = idx / CS;
++
++        if (i <= j) {
++            float dot_k = 0.0f;
++            float dot_q = 0.0f;
++            for (int d = 0; d < (int) S_v; ++d) {
++                const float kd   = k_base[i * sk2 + d];
++                const float kd_j = k_base[j * sk2 + d];
++                dot_k += kd * kd_j;
++                dot_q += kd * q_base[j * sk2 + d];
++            }
++            const float decay = expf(g_base[j] - g_base[i]);
++            const float bj    = b_base[j * sb2];
++            akk[i + j * CS]   = dot_k * bj * decay;
++            akq[i + j * CS]   = dot_q * decay * scale;
++        } else {
++            akk[i + j * CS] = 0.0f;
++            akq[i + j * CS] = 0.0f;
++        }
++    }
++}
++
++template <size_t CS>
++static __global__ void gdn_chunk_prepare_solve_kernel(const float * A, float * lhs, float * rhs) {
++    const int64_t offset = (int64_t) blockIdx.x * CS * CS;
++    const float * A_b      = A + offset;
++    float *       lhs_b    = lhs + offset;
++    float *       rhs_b    = rhs + offset;
++
++    for (int idx = threadIdx.x; idx < (int) (CS * CS); idx += blockDim.x) {
++        const int i   = idx % CS;
++        const int j   = idx / CS;
++        const float v = A_b[idx];
++
++        if (i < j) {
++            lhs_b[idx] = v;
++            rhs_b[idx] = -v;
++        } else if (i == j) {
++            lhs_b[idx] = 1.0f;
++            rhs_b[idx] = 0.0f;
++        } else {
++            lhs_b[idx] = 0.0f;
++            rhs_b[idx] = 0.0f;
++        }
++    }
++}
++
++template <size_t CS>
++static __global__ void gdn_chunk_add_identity_kernel(float * X) {
++    const int64_t offset = (int64_t) blockIdx.x * CS * CS;
++    float *       X_b    = X + offset;
++    const int     tid    = threadIdx.x;
++    if (tid < (int) CS) {
++        X_b[tid + tid * CS] += 1.0f;
++    }
++}
++
++template <size_t CS, size_t S_v>
++static __global__ void gdn_chunk_wu_kernel(const float * k,
++                                           const float * v,
++                                           const float * A,
++                                           const float * beta,
++                                           const float * gate_cs,
++                                           float *       k_cd,
++                                           float *       v_new,
++                                           int64_t       sk1,
++                                           int64_t       sk2,
++                                           int64_t       sk3,
++                                           int64_t       sv1,
++                                           int64_t       sv2,
++                                           int64_t       sv3,
++                                           int64_t       sa1,
++                                           int64_t       sa2,
++                                           int64_t       sa3,
++                                           int64_t       sb1,
++                                           int64_t       sb2,
++                                           int64_t       sb3,
++                                           int64_t       sg1,
++                                           int64_t       sg3,
++                                           int64_t       sd1,
++                                           int64_t       sd2,
++                                           int64_t       sd3) {
++    const int h_idx     = blockIdx.x;
++    const int chunk_idx = blockIdx.y;
++    const int seq_idx   = blockIdx.z;
++
++    const float * k_ch = k + h_idx * sk1 + chunk_idx * CS * sk2 + seq_idx * sk3;
++    const float * v_ch = v + h_idx * sv1 + chunk_idx * CS * sv2 + seq_idx * sv3;
++    const float * g_ch = gate_cs + h_idx * sg1 + chunk_idx * CS + seq_idx * sg3;
++    const float * b_ch = beta + h_idx * sb1 + chunk_idx * CS * sb2 + seq_idx * sb3;
++    const float * A_ch = A + ((int64_t) seq_idx * sa3 + h_idx * sa2 + chunk_idx * sa1) * CS * CS;
++
++    float * kcd_out = k_cd + h_idx * sd1 + chunk_idx * sd2 + seq_idx * sd3;
++    float * v_out   = v_new + h_idx * sd1 + chunk_idx * sd2 + seq_idx * sd3;
++
++    __shared__ float A_s[CS * CS];
++    for (int idx = threadIdx.x; idx < (int) (CS * CS); idx += blockDim.x) {
++        A_s[idx] = A_ch[idx];
++    }
++    __syncthreads();
++
++    for (int idx = threadIdx.x; idx < (int) (S_v * CS); idx += blockDim.x) {
++        const int d = idx / CS;
++        const int t = idx % CS;
++
++        float sum_k = 0.0f;
++        float sum_v = 0.0f;
++        const float kb = b_ch[t * sb2];
++        const float kg = kb * expf(g_ch[t]);
++        for (int j = 0; j < (int) CS; ++j) {
++            sum_k += A_s[t + j * CS] * k_ch[j * sk2 + d] * kg;
++            sum_v += A_s[t + j * CS] * v_ch[j * sv2 + d] * kb;
++        }
++        kcd_out[d + t * S_v] = sum_k;
++        v_out[d + t * S_v]   = sum_v;
++    }
++}
++
++// State layout matches AR kernel: S[i][col] at col * S_v + i (transposed).
++template <size_t CS, size_t S_v>
++static __global__ void gdn_chunk_state_kernel(const float * k_raw,
++                                              float *       v_new,
++                                              const float * k_cd,
++                                              const float * g_cs,
++                                              const float * state_in,
++                                              float *       states_out,
++                                              float *       state_final,
++                                              int64_t       sk1,
++                                              int64_t       sk2,
++                                              int64_t       sk3,
++                                              int64_t       ng1,
++                                              int64_t       ng3,
++                                              int64_t       sd1,
++                                              int64_t       sd2,
++                                              int64_t       sd3,
++                                              int64_t       n_chunks,
++                                              int64_t       H) {
++    const int h_idx   = blockIdx.x;
++    const int seq_idx = blockIdx.y;
++    const int64_t hs  = (int64_t) seq_idx * H + h_idx;
++
++    __shared__ float smem_state[S_v * S_v];
++
++    const float * s_in = state_in + hs * S_v * S_v;
++    for (int idx = threadIdx.x; idx < (int) (S_v * S_v); idx += blockDim.x) {
++        smem_state[idx] = s_in[idx];
++    }
++    __syncthreads();
++
++    for (int c = 0; c < (int) n_chunks; ++c) {
++        float * s_out = states_out + (hs * n_chunks + c) * S_v * S_v;
++        for (int idx = threadIdx.x; idx < (int) (S_v * S_v); idx += blockDim.x) {
++            s_out[idx] = smem_state[idx];
++        }
++        __syncthreads();
++
++        const float * kcd_ptr = k_cd + h_idx * sd1 + c * sd2 + seq_idx * sd3;
++        float *       v_ptr   = v_new + h_idx * sd1 + c * sd2 + seq_idx * sd3;
++
++        // v_new[t, col] -= sum_k k_cd[k, t] * S[k, col]
++        for (int idx = threadIdx.x; idx < (int) (S_v * CS); idx += blockDim.x) {
++            const int col = idx / CS;
++            const int t   = idx % CS;
++
++            float vp = 0.0f;
++            for (int k = 0; k < (int) S_v; ++k) {
++                vp += kcd_ptr[k + t * S_v] * smem_state[col * S_v + k];
++            }
++            v_ptr[col + t * S_v] -= vp;
++        }
++        __syncthreads();
++
++        const float * k_ch = k_raw + h_idx * sk1 + seq_idx * sk3 + c * (int64_t) CS * sk2;
++        const float * g_ch = g_cs + h_idx * ng1 + c * CS + seq_idx * ng3;
++        const float   g_last = g_ch[CS - 1];
++        const float   gate   = expf(g_last);
++
++        // S[i][col] = gate * S[i][col] + sum_t k[i,t]*exp(g_last-g[t]) * v_new[t,col]
++        for (int idx = threadIdx.x; idx < (int) (S_v * S_v); idx += blockDim.x) {
++            const int col = idx / S_v;
++            const int i   = idx % S_v;
++
++            float kgv = 0.0f;
++            for (int t = 0; t < (int) CS; ++t) {
++                kgv += k_ch[i + t * sk2] * expf(g_last - g_ch[t]) * v_ptr[col + t * S_v];
++            }
++            smem_state[col * S_v + i] = gate * smem_state[col * S_v + i] + kgv;
++        }
++        __syncthreads();
++    }
++
++    float * s_final = state_final + hs * S_v * S_v;
++    for (int idx = threadIdx.x; idx < (int) (S_v * S_v); idx += blockDim.x) {
++        s_final[idx] = smem_state[idx];
++    }
++}
++
++template <size_t CS, size_t S_v>
++static __global__ void gdn_chunk_output_kernel(const float * q,
++                                               const float * v_delta,
++                                               const float * Akq,
++                                               const float * states,
++                                               const float * g_cs,
++                                               float *       output,
++                                               int64_t       sq1,
++                                               int64_t       sq2,
++                                               int64_t       sq3,
++                                               int64_t       ng1,
++                                               int64_t       ng3,
++                                               int64_t       sd1,
++                                               int64_t       sd2,
++                                               int64_t       sd3,
++                                               int64_t       n_chunks,
++                                               int64_t       H,
++                                               int64_t       n_tokens,
++                                               float         scale) {
++    const int h_idx     = blockIdx.x;
++    const int seq_idx   = blockIdx.y;
++    const int chunk_idx = blockIdx.z;
++    const int64_t hs    = (int64_t) seq_idx * H + h_idx;
++
++    const float * chunk_state = states + (hs * n_chunks + chunk_idx) * S_v * S_v;
++    const float * chunk_vd    = v_delta + h_idx * sd1 + chunk_idx * sd2 + seq_idx * sd3;
++    const float * chunk_akq   = Akq + ((int64_t) seq_idx * H * n_chunks + h_idx * n_chunks + chunk_idx) * CS * CS;
++    const float * chunk_g     = g_cs + h_idx * ng1 + chunk_idx * CS + seq_idx * ng3;
++    const float * q_base      = q + h_idx * sq1 + seq_idx * sq3 + chunk_idx * (int64_t) CS * sq2;
++    float *       out_base    = output + h_idx * S_v + seq_idx * n_tokens * S_v * H + chunk_idx * (int64_t) CS * S_v * H;
++
++    __shared__ float s_akq[CS * CS];
++    __shared__ float s_gexp[CS];
++
++    for (int idx = threadIdx.x; idx < (int) (CS * CS); idx += blockDim.x) {
++        s_akq[idx] = chunk_akq[idx];
++    }
++    if (threadIdx.x < (int) CS) {
++        s_gexp[threadIdx.x] = expf(chunk_g[threadIdx.x]);
++    }
++    __syncthreads();
++
++    for (int idx = threadIdx.x; idx < (int) (S_v * CS); idx += blockDim.x) {
++        const int d = idx / CS;
++        const int t = idx % CS;
++
++        float attn = 0.0f;
++        for (int i = 0; i < (int) S_v; ++i) {
++            attn += chunk_state[d * S_v + i] * q_base[i + t * sq2] * s_gexp[t];
++        }
++        attn *= scale;
++
++        float v_attn = 0.0f;
++        for (int j = 0; j <= t; ++j) {
++            v_attn += chunk_vd[d + j * S_v] * s_akq[j + t * CS];
++        }
++
++        out_base[d + t * S_v * H] = attn + v_attn;
++    }
++}
++
++void ggml_cuda_gdn_chunked_prefill(
++        ggml_backend_cuda_context & ctx,
++        const float *               q_d,
++        const float *               k_d,
++        const float *               v_d,
++        const float *               g_d,
++        const float *               b_d,
++        const float *               s_d,
++        float *                     dst_d,
++        float *                     state_d,
++        int64_t                     S_v,
++        int64_t                     H,
++        int64_t                     n_tokens,
++        int64_t                     n_seqs,
++        int64_t                     sq1,
++        int64_t                     sq2,
++        int64_t                     sq3,
++        int64_t                     sv1,
++        int64_t                     sv2,
++        int64_t                     sv3,
++        int64_t                     sb1,
++        int64_t                     sb2,
++        int64_t                     sb3,
++        int64_t                     sg1,
++        int64_t                     sg2,
++        int64_t                     sg3,
++        int64_t                     neqk1,
++        int64_t                     rq3,
++        float                       scale,
++        cudaStream_t                stream) {
++    static constexpr int CS = GGML_CUDA_GDN_CHUNK_SIZE;
++
++    const int64_t n_full  = (n_tokens / CS) * CS;
++    const int64_t n_tail  = n_tokens - n_full;
++    const int     n_chunks = (int) (n_full / CS);
++
++    if (n_chunks == 0) {
++        ggml_cuda_gdn_launch_ar(
++            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++            sb1, sb2, sb3, neqk1, rq3, scale, 0, 1, 0.0f, n_tokens, 0, stream);
++        return;
++    }
++
++    const int64_t ng1 = CS * n_chunks;
++    const int64_t ng3 = CS * n_chunks * H;
++
++    ggml_cuda_pool_alloc<float> gate_csum(ctx.pool(), CS * n_chunks * H * n_seqs);
++    ggml_cuda_pool_alloc<float> Akk(ctx.pool(), CS * CS * n_chunks * H * n_seqs);
++    ggml_cuda_pool_alloc<float> Akq(ctx.pool(), CS * CS * n_chunks * H * n_seqs);
++
++    {
++        dim3 grid(H, n_chunks, n_seqs);
++        gdn_chunk_cumsum_kernel<CS><<<grid, 1, 0, stream>>>(
++            g_d, gate_csum.get(), sg1, sg2, sg3, ng1, ng3);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    {
++        dim3 grid(H, n_chunks, n_seqs);
++        dim3 block(256);
++        gdn_chunk_kkt_kernel<CS, 128><<<grid, block, 0, stream>>>(
++            k_d, q_d, gate_csum.get(), b_d, Akk.get(), Akq.get(),
++            sq1, sq2, sq3, ng1, ng3, sb1, sb2, sb3, scale);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    {
++        const int64_t n_batches = (int64_t) n_chunks * H * n_seqs;
++        ggml_cuda_pool_alloc<float> lhs(ctx.pool(), CS * CS * n_batches);
++        ggml_cuda_pool_alloc<float> rhs(ctx.pool(), CS * CS * n_batches);
++
++        gdn_chunk_prepare_solve_kernel<CS><<<n_batches, 256, 0, stream>>>(
++            Akk.get(), lhs.get(), rhs.get());
++        CUDA_CHECK(cudaGetLastError());
++
++        const size_t bs = CS * CS;
++        ggml_cuda_solve_tri_f32(ctx, lhs.get(), rhs.get(), Akk.get(), CS, CS,
++            n_batches, 1, bs, bs * n_batches, bs, bs * n_batches, bs, bs * n_batches, stream);
++
++        gdn_chunk_add_identity_kernel<CS><<<n_batches, CS, 0, stream>>>(Akk.get());
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    const int64_t sd1 = S_v * CS * n_chunks;
++    const int64_t sd2 = S_v * CS;
++    const int64_t sd3 = S_v * CS * n_chunks * H;
++
++    ggml_cuda_pool_alloc<float> k_cd(ctx.pool(), S_v * CS * n_chunks * H * n_seqs);
++    ggml_cuda_pool_alloc<float> v_new(ctx.pool(), S_v * CS * n_chunks * H * n_seqs);
++
++    {
++        const int64_t sa1 = CS * CS;
++        const int64_t sa2 = CS * CS * n_chunks;
++        const int64_t sa3 = CS * CS * n_chunks * H;
++
++        dim3 grid(H, n_chunks, n_seqs);
++        gdn_chunk_wu_kernel<CS, 128><<<grid, 256, 0, stream>>>(
++            k_d, v_d, Akk.get(), b_d, gate_csum.get(), k_cd.get(), v_new.get(),
++            sq1, sq2, sq3, sv1, sv2, sv3, sa1, sa2, sa3, sb1, sb2, sb3, ng1, ng3, sd1, sd2, sd3);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    ggml_cuda_pool_alloc<float> states(ctx.pool(), S_v * S_v * n_chunks * H * n_seqs);
++    ggml_cuda_pool_alloc<float> state_out(ctx.pool(), S_v * S_v * H * n_seqs);
++
++    {
++        dim3 grid(H, n_seqs);
++        gdn_chunk_state_kernel<CS, 128><<<grid, 256, 0, stream>>>(
++            k_d, v_new.get(), k_cd.get(), gate_csum.get(), s_d,
++            states.get(), state_out.get(),
++            sq1, sq2, sq3, ng1, ng3, sd1, sd2, sd3, n_chunks, H);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    {
++        dim3 grid(H, n_seqs, n_chunks);
++        gdn_chunk_output_kernel<CS, 128><<<grid, 256, 0, stream>>>(
++            q_d, v_new.get(), Akq.get(), states.get(), gate_csum.get(), dst_d,
++            sq1, sq2, sq3, ng1, ng3, sd1, sd2, sd3, n_chunks, H, n_tokens, scale);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    if (n_tail == 0) {
++        CUDA_CHECK(cudaMemcpyAsync(state_d, state_out.get(), S_v * S_v * H * n_seqs * sizeof(float),
++                                   cudaMemcpyDeviceToDevice, stream));
++    } else {
++        const float * q_tail = q_d + n_full * sq2;
++        const float * k_tail = k_d + n_full * sq2;
++        const float * v_tail = v_d + n_full * sv2;
++        const float * g_tail = g_d + n_full * sg2;
++        const float * b_tail = b_d + n_full * sb2;
++
++        ggml_cuda_gdn_launch_ar(
++            q_tail, k_tail, v_tail, g_tail, b_tail, state_out.get(), dst_d, state_d,
++            S_v, H, n_tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++            sb1, sb2, sb3, neqk1, rq3, scale, 0, 1, 0.0f, n_tokens, n_full, stream);
++    }
++}
++
++#else
++
++void ggml_cuda_gdn_chunked_prefill(
++        ggml_backend_cuda_context & ctx,
++        const float *               q_d,
++        const float *               k_d,
++        const float *               v_d,
++        const float *               g_d,
++        const float *               b_d,
++        const float *               s_d,
++        float *                     dst_d,
++        float *                     state_d,
++        int64_t                     S_v,
++        int64_t                     H,
++        int64_t                     n_tokens,
++        int64_t                     n_seqs,
++        int64_t                     sq1,
++        int64_t                     sq2,
++        int64_t                     sq3,
++        int64_t                     sv1,
++        int64_t                     sv2,
++        int64_t                     sv3,
++        int64_t                     sb1,
++        int64_t                     sb2,
++        int64_t                     sb3,
++        int64_t                     sg1,
++        int64_t                     sg2,
++        int64_t                     sg3,
++        int64_t                     neqk1,
++        int64_t                     rq3,
++        float                       scale,
++        cudaStream_t                stream) {
++    GGML_UNUSED(ctx);
++    GGML_UNUSED(q_d);
++    GGML_UNUSED(k_d);
++    GGML_UNUSED(v_d);
++    GGML_UNUSED(g_d);
++    GGML_UNUSED(b_d);
++    GGML_UNUSED(s_d);
++    GGML_UNUSED(dst_d);
++    GGML_UNUSED(state_d);
++    GGML_UNUSED(S_v);
++    GGML_UNUSED(H);
++    GGML_UNUSED(n_tokens);
++    GGML_UNUSED(n_seqs);
++    GGML_UNUSED(sq1);
++    GGML_UNUSED(sq2);
++    GGML_UNUSED(sq3);
++    GGML_UNUSED(sv1);
++    GGML_UNUSED(sv2);
++    GGML_UNUSED(sv3);
++    GGML_UNUSED(sb1);
++    GGML_UNUSED(sb2);
++    GGML_UNUSED(sb3);
++    GGML_UNUSED(sg1);
++    GGML_UNUSED(sg2);
++    GGML_UNUSED(sg3);
++    GGML_UNUSED(neqk1);
++    GGML_UNUSED(rq3);
++    GGML_UNUSED(scale);
++    GGML_UNUSED(stream);
++    GGML_ABORT("ggml_cuda_gdn_chunked_prefill called but GGML_CUDA_GDN_CHUNKED=0");
++}
++
++#endif // GGML_CUDA_GDN_CHUNKED
+diff --git a/ggml/src/ggml-cuda/solve_tri.cu b/ggml/src/ggml-cuda/solve_tri.cu
+index 07ca33f5..94f8824b 100644
+--- a/ggml/src/ggml-cuda/solve_tri.cu
++++ b/ggml/src/ggml-cuda/solve_tri.cu
+@@ -273,3 +273,23 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+                              dst->nb[3] / sizeof(float), ctx.stream());
+     }
+ }
++
++void ggml_cuda_solve_tri_f32(
++        ggml_backend_cuda_context & ctx,
++        const float *               A,
++        const float *               B,
++        float *                     X,
++        int                         n,
++        int                         k,
++        int64_t                     ne02,
++        int64_t                     ne03,
++        size_t                      nb02,
++        size_t                      nb03,
++        size_t                      nb12,
++        size_t                      nb13,
++        size_t                      nb2,
++        size_t                      nb3,
++        cudaStream_t                stream) {
++    GGML_UNUSED(ctx);
++    solve_tri_f32_cuda(A, B, X, n, k, ne02, ne03, nb02, nb03, nb12, nb13, nb2, nb3, stream);
++}
+diff --git a/ggml/src/ggml-cuda/solve_tri.cuh b/ggml/src/ggml-cuda/solve_tri.cuh
+index 63999239..5cf0cf88 100644
+--- a/ggml/src/ggml-cuda/solve_tri.cuh
++++ b/ggml/src/ggml-cuda/solve_tri.cuh
+@@ -1,3 +1,21 @@
+ #include "common.cuh"
+ 
+ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// Batched lower-triangular solve used by gated_delta_net chunked prefill (contiguous batch strides).
++void ggml_cuda_solve_tri_f32(
++        ggml_backend_cuda_context & ctx,
++        const float *               A,
++        const float *               B,
++        float *                     X,
++        int                         n,
++        int                         k,
++        int64_t                     ne02,
++        int64_t                     ne03,
++        size_t                      nb02,
++        size_t                      nb03,
++        size_t                      nb12,
++        size_t                      nb13,
++        size_t                      nb2,
++        size_t                      nb3,
++        cudaStream_t                stream);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 1134a3bb..947a509a 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -18601,7 +18601,7 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
+         } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
+             tensor_clone = ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
+             src_clone[2], src_clone[3], src_clone[4], src_clone[5],
+-            ggml_get_op_params_i32(tensor, 0));
++            ggml_get_op_params_i32(tensor, 0), ggml_get_op_params_f32(tensor, 1));
+         } else if (tensor->op == GGML_OP_OPT_STEP_ADAMW) {
+             src_clone[0]->flags = tensor->src[0]->flags;
+             tensor_clone = ggml_opt_step_adamw(ggml_ctx, src_clone[0], src_clone[1],
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 5d880499..2f22ce96 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6242,7 +6242,8 @@ struct ggml_tensor * ggml_gated_delta_net(
+         struct ggml_tensor  * g,
+         struct ggml_tensor  * beta,
+         struct ggml_tensor  * state,
+-        int64_t               K) {
++        int64_t               K,
++        float                 fuse_l2_eps) {
+     GGML_ASSERT(ggml_is_contiguous_rows(q));
+     GGML_ASSERT(ggml_is_contiguous_rows(k));
+     GGML_ASSERT(ggml_is_contiguous_rows(v));
+@@ -6277,6 +6278,7 @@ struct ggml_tensor * ggml_gated_delta_net(
+     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+ 
+     ggml_set_op_params_i32(result, 0, (int32_t) K);
++    ggml_set_op_params_f32(result, 1, fuse_l2_eps);
+ 
+     result->op     = GGML_OP_GATED_DELTA_NET;
+     result->src[0] = q;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3a469bc9..5a4f6478 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -98,6 +98,7 @@ llama_context::llama_context(
+     cparams.embeddings              = params.embeddings;
+     cparams.embeddings_nextn        = false;
+     cparams.embeddings_nextn_masked = false;
++    cparams.embeddings_nextn_gpu_resident = false;
+     cparams.offload_kqv             = params.offload_kqv;
+     cparams.no_perf                 = params.no_perf;
+     cparams.warmup                  = false;
+@@ -906,7 +907,7 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
+     output_reorder();
+ 
+     try {
+-        if (embd_nextn.data == nullptr) {
++        if (embd_nextn.data == nullptr && !cparams.embeddings_nextn_gpu_resident) {
+             throw std::runtime_error("no nextn embeddings");
+         }
+ 
+@@ -917,10 +918,30 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
+             if (i < 0 || (size_t)(i + 1) * n_embd > embd_nextn.size) {
+                 throw std::runtime_error(format("out of range [0, %zu)", embd_nextn.size / n_embd));
+             }
++
++            if (cparams.embeddings_nextn_gpu_resident && t_embd_nextn_dev) {
++                if (!embd_nextn.data) {
++                    throw std::runtime_error("no nextn embeddings host buffer");
++                }
++                if (!mtp_get_h_row(i, embd_nextn.data + (size_t) i * n_embd, (int32_t) n_embd)) {
++                    throw std::runtime_error("failed to read gpu-resident nextn row");
++                }
++            }
++
+             return embd_nextn.data + (size_t) i * n_embd;
+         }
+ 
+         const int64_t j = output_resolve_row(i);
++
++        if (cparams.embeddings_nextn_gpu_resident && t_embd_nextn_dev) {
++            if (!embd_nextn.data) {
++                throw std::runtime_error("no nextn embeddings host buffer");
++            }
++            if (!mtp_get_h_row((int32_t) j, embd_nextn.data + j*n_embd, (int32_t) n_embd)) {
++                throw std::runtime_error("failed to read gpu-resident nextn row");
++            }
++        }
++
+         return embd_nextn.data + j*n_embd;
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: invalid nextn embeddings id %d, reason: %s\n", __func__, i, err.what());
+@@ -1127,6 +1148,16 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
+     cparams.embeddings_nextn_masked = masked;
+ }
+ 
++void llama_context::set_embeddings_nextn_gpu_resident(bool value) {
++    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
++
++    cparams.embeddings_nextn_gpu_resident = value;
++
++    if (value) {
++        sched_need_reserve = true;
++    }
++}
++
+ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
+     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
+ 
+@@ -1340,6 +1371,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+         res->set_inputs(&ubatch);
+ 
++        apply_mtp_h_pending(res);
++
+         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+ 
+@@ -1500,12 +1533,14 @@ int llama_context::encode(const llama_batch & batch_inp) {
+ 
+     // extract nextn embeddings (hidden state before the final output norm)
+     if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+-        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+-        GGML_ASSERT(backend_h != nullptr);
++        if (!cparams.embeddings_nextn_gpu_resident) {
++            ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
++            GGML_ASSERT(backend_h != nullptr);
+ 
+-        const uint32_t n_embd = hparams.n_embd_out();
+-        GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
+-        ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
++            const uint32_t n_embd = hparams.n_embd_out();
++            GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
++            ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
++        }
+     }
+ 
+     // TODO: hacky solution
+@@ -1953,15 +1988,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
+ 
+             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+-                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+-                GGML_ASSERT(backend_h != nullptr);
++                if (!cparams.embeddings_nextn_gpu_resident) {
++                    ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
++                    GGML_ASSERT(backend_h != nullptr);
+ 
+-                const uint32_t n_embd  = hparams.n_embd_out();
+-                float * embd_nextn_out = embd_nextn.data + offset*n_embd;
++                    const uint32_t n_embd  = hparams.n_embd_out();
++                    float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+ 
+-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
++                    GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
++                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
++                }
+             }
++
++            handle_mtp_for_ubatch(ubatch, res, n_tokens_prev, n_outputs_prev);
+         }
+ 
+         // Copy backend sampling output if this ubatch produced any sampling tensors.
+@@ -2076,6 +2115,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+         embd_nextn.size = (size_t) n_embd_out * n_batch;
+     }
+ 
++    if (has_embd_nextn && cparams.embeddings_nextn_gpu_resident) {
++        const int64_t n_rows = cparams.embeddings_nextn_masked ? n_outputs_max : (int64_t) n_batch;
++        ensure_embd_nextn_dev(n_embd_out, n_rows);
++    }
++
+     for (bool enabled : cparams.embeddings_layer_inp) {
+         if (enabled) {
+             embd_layer_inp_float_count += (size_t) n_embd * n_batch;
+@@ -2203,6 +2247,179 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+     return n_outputs_max;
+ }
+ 
++bool llama_context::ensure_embd_nextn_dev(int64_t n_embd, int64_t n_rows) {
++    if (!cparams.embeddings_nextn_gpu_resident || n_embd <= 0 || n_rows <= 0) {
++        return false;
++    }
++
++    const size_t nbytes = (size_t) n_embd * (size_t) n_rows * sizeof(float);
++
++    if (buf_embd_nextn_dev && ggml_backend_buffer_get_size(buf_embd_nextn_dev.get()) >= nbytes && t_embd_nextn_dev) {
++        return true;
++    }
++
++    synchronize();
++
++    buf_embd_nextn_dev = nullptr;
++    t_embd_nextn_dev   = nullptr;
++    ctx_embd_nextn_dev = nullptr;
++
++    ggml_backend_dev_t dev = model.dev_output();
++    if (!dev) {
++        return false;
++    }
++
++    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
++    if (!buft) {
++        return false;
++    }
++
++    buf_embd_nextn_dev.reset(ggml_backend_buft_alloc_buffer(buft, nbytes));
++    if (!buf_embd_nextn_dev) {
++        return false;
++    }
++
++    ggml_init_params params = {
++        /*.mem_size   =*/ ggml_tensor_overhead(),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++
++    ctx_embd_nextn_dev.reset(ggml_init(params));
++    if (!ctx_embd_nextn_dev) {
++        buf_embd_nextn_dev = nullptr;
++        return false;
++    }
++
++    t_embd_nextn_dev = ggml_new_tensor_2d(ctx_embd_nextn_dev.get(), GGML_TYPE_F32, n_embd, n_rows);
++    void * base = ggml_backend_buffer_get_base(buf_embd_nextn_dev.get());
++    if (ggml_backend_tensor_alloc(buf_embd_nextn_dev.get(), t_embd_nextn_dev, base) != GGML_STATUS_SUCCESS) {
++        buf_embd_nextn_dev = nullptr;
++        t_embd_nextn_dev   = nullptr;
++        ctx_embd_nextn_dev = nullptr;
++        return false;
++    }
++
++    return true;
++}
++
++void llama_context::copy_embd_rows_dev(
++        ggml_tensor * dst,
++        int32_t       dst_row,
++        ggml_tensor * src,
++        int32_t       src_row,
++        int32_t       n_rows,
++        int32_t       n_embd) {
++    if (!ctx_embd_nextn_dev || n_rows <= 0 || !dst || !src) {
++        return;
++    }
++
++    ggml_context * ctx = ctx_embd_nextn_dev.get();
++
++    for (int32_t i = 0; i < n_rows; ++i) {
++        ggml_tensor * src_view = ggml_view_2d(
++                ctx, src,
++                n_embd, 1,
++                src->nb[1],
++                (int64_t) (src_row + i) * src->nb[1]);
++
++        ggml_tensor * dst_view = ggml_view_2d(
++                ctx, dst,
++                n_embd, 1,
++                dst->nb[1],
++                (int64_t) (dst_row + i) * dst->nb[1]);
++
++        ggml_backend_tensor_copy(src_view, dst_view);
++    }
++}
++
++void llama_context::handle_mtp_for_ubatch(
++        const llama_ubatch & ubatch,
++        const llm_graph_result * res,
++        int64_t n_tokens_prev,
++        int64_t n_outputs_prev) {
++    if (!cparams.embeddings_nextn || !cparams.embeddings_nextn_gpu_resident) {
++        return;
++    }
++
++    ggml_tensor * t_h_nextn = res->get_h_nextn();
++    if (!t_h_nextn || !t_embd_nextn_dev) {
++        return;
++    }
++
++    const int32_t n_embd = (int32_t) model.hparams.n_embd_out();
++    const bool masked    = cparams.embeddings_nextn_masked;
++    const int64_t n_rows = masked ? n_outputs : (int64_t) ubatch.n_tokens;
++    const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
++
++    if (n_rows <= 0) {
++        return;
++    }
++
++    GGML_ASSERT(offset + n_rows <= t_embd_nextn_dev->ne[1]);
++
++    ggml_context * ctx = ctx_embd_nextn_dev.get();
++
++    ggml_tensor * src_view = ggml_view_2d(ctx, t_h_nextn, n_embd, n_rows, t_h_nextn->nb[1], 0);
++    ggml_tensor * dst_view = ggml_view_2d(
++            ctx, t_embd_nextn_dev, n_embd, n_rows, t_embd_nextn_dev->nb[1],
++            offset * t_embd_nextn_dev->nb[1]);
++
++    ggml_backend_tensor_copy(src_view, dst_view);
++}
++
++void llama_context::apply_mtp_h_pending(const llm_graph_result * res) {
++    if (mtp_h_pending.empty()) {
++        return;
++    }
++
++    ggml_tensor * t_inp_h = res->get_inp_h();
++    if (!t_inp_h) {
++        mtp_h_pending.clear();
++        return;
++    }
++
++    const int32_t n_embd = (int32_t) model.hparams.n_embd_out();
++
++    for (const auto & spec : mtp_h_pending) {
++        if (!spec.src_ctx || !spec.src_ctx->t_embd_nextn_dev) {
++            continue;
++        }
++
++        copy_embd_rows_dev(
++                t_inp_h, spec.dst_row,
++                spec.src_ctx->t_embd_nextn_dev, spec.src_row,
++                spec.n_rows, n_embd);
++    }
++
++    mtp_h_pending.clear();
++}
++
++void llama_context::mtp_clear_h_pending() {
++    mtp_h_pending.clear();
++}
++
++void llama_context::mtp_queue_h_rows(llama_context * src, int32_t dst_row, int32_t src_row, int32_t n_rows) {
++    if (n_rows <= 0) {
++        return;
++    }
++
++    mtp_h_pending.push_back({ src, dst_row, src_row, n_rows });
++}
++
++bool llama_context::mtp_get_h_row(int32_t row, float * dst, int32_t n_embd) {
++    if (!dst || !t_embd_nextn_dev || row < 0 || row >= (int32_t) t_embd_nextn_dev->ne[1]) {
++        return false;
++    }
++
++    ggml_context * ctx = ctx_embd_nextn_dev.get();
++    ggml_tensor * src_view = ggml_view_2d(
++            ctx, t_embd_nextn_dev, n_embd, 1, t_embd_nextn_dev->nb[1], (int64_t) row * t_embd_nextn_dev->nb[1]);
++
++    ggml_backend_tensor_get(src_view, dst, 0, (size_t) n_embd * sizeof(float));
++    return true;
++}
++
+ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+         if (!cparams.embeddings_layer_inp[il]) {
+@@ -3685,6 +3902,27 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
+     ctx->set_embeddings_nextn(value, masked);
+ }
+ 
++void llama_set_embeddings_nextn_gpu_resident(llama_context * ctx, bool value) {
++    ctx->set_embeddings_nextn_gpu_resident(value);
++}
++
++void llama_mtp_clear_h_pending(llama_context * ctx_dst) {
++    ctx_dst->mtp_clear_h_pending();
++}
++
++void llama_mtp_queue_h_rows(
++        llama_context * ctx_dst,
++        llama_context * ctx_src,
++        int32_t dst_row,
++        int32_t src_row,
++        int32_t n_rows) {
++    ctx_dst->mtp_queue_h_rows(ctx_src, dst_row, src_row, n_rows);
++}
++
++bool llama_mtp_get_h_row(llama_context * ctx, int32_t row, float * dst, int32_t n_embd) {
++    return ctx->mtp_get_h_row(row, dst, n_embd);
++}
++
+ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
+     ctx->set_embeddings_layer_inp(lid, value);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa8..5386e11e 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -114,11 +114,17 @@ struct llama_context {
+ 
+     void set_embeddings (bool value);
+     void set_embeddings_nextn(bool value, bool masked);
++    void set_embeddings_nextn_gpu_resident(bool value);
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
+     void set_causal_attn(bool value);
+     void set_warmup(bool value);
+ 
++    // GPU-resident MTP helpers (staging on device; see llama-ext.h wrappers)
++    void mtp_clear_h_pending();
++    void mtp_queue_h_rows(llama_context * src, int32_t dst_row, int32_t src_row, int32_t n_rows);
++    bool mtp_get_h_row(int32_t row, float * dst, int32_t n_embd);
++
+     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+ 
+     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+@@ -234,6 +240,25 @@ private:
+     // from backend into host-side embd_layer_inp buffers
+     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+ 
++    // GPU-resident MTP: copy h_nextn rows to device staging and apply pending inp-h copies
++    void handle_mtp_for_ubatch(
++            const llama_ubatch & ubatch,
++            const llm_graph_result * res,
++            int64_t n_tokens_prev,
++            int64_t n_outputs_prev);
++
++    bool ensure_embd_nextn_dev(int64_t n_embd, int64_t n_rows);
++
++    void apply_mtp_h_pending(const llm_graph_result * res);
++
++    void copy_embd_rows_dev(
++            ggml_tensor * dst,
++            int32_t       dst_row,
++            ggml_tensor * src,
++            int32_t       src_row,
++            int32_t       n_rows,
++            int32_t       n_embd);
++
+     //
+     // graph
+     //
+@@ -370,6 +395,20 @@ private:
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+ 
++    // device staging for h_nextn when embeddings_nextn_gpu_resident is enabled
++    ggml_backend_buffer_ptr buf_embd_nextn_dev;
++    ggml_context_ptr        ctx_embd_nextn_dev;
++    ggml_tensor *           t_embd_nextn_dev = nullptr;
++
++    struct mtp_h_row_copy {
++        llama_context * src_ctx  = nullptr;
++        int32_t         dst_row  = 0;
++        int32_t         src_row  = 0;
++        int32_t         n_rows   = 0;
++    };
++
++    std::vector<mtp_h_row_copy> mtp_h_pending;
++
+     // keep copies of the per-sequence memory on the device
+     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 58520caa..1e4d9be5 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -34,6 +34,7 @@ struct llama_cparams {
+     bool embeddings;
+     bool embeddings_nextn;        // also extract the hidden state before the final output norm
+     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
++    bool embeddings_nextn_gpu_resident; // keep h_nextn on device; skip bulk D2H in decode
+     bool causal_attn;
+     bool offload_kqv;
+     bool flash_attn;
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 348bbae9..5e847579 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -95,6 +95,27 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
+ // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+ 
++// Keep h_nextn on the GPU in a device staging buffer; avoids bulk D2H in decode.
++// MTP draft drivers should enable this on both target and draft contexts.
++LLAMA_API void llama_set_embeddings_nextn_gpu_resident(struct llama_context * ctx, bool value);
++
++// Queue a device-to-device copy of h_nextn rows from src staging into the next
++// decode's MTP h input on ctx_dst. Cleared after the following llama_decode().
++LLAMA_API void llama_mtp_clear_h_pending(struct llama_context * ctx_dst);
++LLAMA_API void llama_mtp_queue_h_rows(
++        struct llama_context * ctx_dst,
++        struct llama_context * ctx_src,
++        int32_t dst_row,
++        int32_t src_row,
++        int32_t n_rows);
++
++// Read one h_nextn row from GPU staging into host memory (single-row D2H).
++LLAMA_API bool llama_mtp_get_h_row(
++        struct llama_context * ctx,
++        int32_t row,
++        float * dst,
++        int32_t n_embd);
++
+ // Select which appended NextN block the DECODER_MTP graph runs (offset past
+ // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
+ // chain multiple trained NextN heads. Default 0 (first head).
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index c8ecb0a2..18f81780 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1194,6 +1194,7 @@ void llm_graph_result::reset() {
+     t_embd        = nullptr;
+     t_embd_pooled = nullptr;
+     t_h_nextn     = nullptr;
++    t_inp_h       = nullptr;
+ 
+     t_layer_inp.resize(LLAMA_MAX_LAYERS);
+     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+@@ -1305,6 +1306,9 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
+ 
+ llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
+     inputs.emplace_back(std::move(input));
++    if (auto * embd_h = dynamic_cast<llm_graph_input_embd_h *>(inputs.back().get())) {
++        t_inp_h = embd_h->h;
++    }
+     return inputs.back().get();
+ }
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index c84cb6a4..d86ff523 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -799,6 +799,7 @@ public:
+     ggml_tensor * get_embd()        const { return t_embd; }
+     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
++    ggml_tensor * get_inp_h()       const { return t_inp_h; }
+ 
+     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+ 
+@@ -834,6 +835,7 @@ public:
+     ggml_tensor * t_embd        = nullptr;
+     ggml_tensor * t_embd_pooled = nullptr;
+     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
++    ggml_tensor * t_inp_h      = nullptr; // [n_embd, n_tokens] MTP hidden input (llm_graph_input_embd_h)
+ 
+     std::vector<ggml_tensor *> t_layer_inp;
+ 
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index ad661264..773780a8 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -377,7 +377,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
+         ggml_tensor * g,
+         ggml_tensor * b,
+         ggml_tensor * s,
+-        int           il) {
++        int           il,
++        float         fuse_l2_eps) {
+     const int64_t S_k      = q->ne[0];
+     const int64_t H_k      = q->ne[1];
+     const int64_t n_tokens = q->ne[2];
+@@ -399,7 +400,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
+     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
+ 
+     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
+-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
++    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1, fuse_l2_eps);
+     if (n_tokens == 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
+     } else {
+@@ -429,18 +430,20 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
+         ggml_tensor * g,
+         ggml_tensor * b,
+         ggml_tensor * s,
+-        int           il) {
++        int           il,
++        float         fuse_l2_eps) {
+     const int64_t n_seq_tokens = q->ne[2];
+ 
+     if (n_seq_tokens == 1) {
+         if (cparams.fused_gdn_ar) {
+-            return build_delta_net_fused(q, k, v, g, b, s, il);
++            return build_delta_net_fused(q, k, v, g, b, s, il, fuse_l2_eps);
+         }
+         return build_delta_net_autoregressive(q, k, v, g, b, s, il);
+     }
+ 
+     if (cparams.fused_gdn_ch) {
+-        return build_delta_net_fused(q, k, v, g, b, s, il);
++        // CUDA/HIP chunked parallel prefill when n_tokens >= GGML_CUDA_GDN_CHUNK_THRESHOLD (see docs/CHUNKED_GDN_PREFILL.md).
++        return build_delta_net_fused(q, k, v, g, b, s, il, fuse_l2_eps);
+     }
+ 
+     return build_delta_net_chunking(q, k, v, g, b, s, il);
+@@ -533,7 +536,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+         ggml_tensor *        g,
+         ggml_tensor *        b,
+         ggml_tensor *        s,
+-        int                  il) {
++        int                  il,
++        float                fuse_l2_eps) {
+     const auto * mctx_cur   = inp->mctx;
+     const auto   kv_head    = mctx_cur->get_head();
+     const uint32_t mem_size = mctx_cur->get_size();
+@@ -543,10 +547,12 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     const int64_t n_seqs       = s->ne[3];
+     const int64_t n_seq_tokens = q->ne[2];
+ 
+-    const bool keep = cparams.n_rs_seq > 0;
++    // multi-token ubatches need snapshot slots for partial rollback; single-token AR
++    // (MTP draft steps) can use the cheaper non-keep GDN path.
++    const bool keep = cparams.n_rs_seq > 0 && n_seq_tokens > 1;
+ 
+     if (!keep) {
+-        auto attn_out = build_delta_net(q, k, v, g, b, s, il);
++        auto attn_out = build_delta_net(q, k, v, g, b, s, il, fuse_l2_eps);
+         ggml_tensor * output    = attn_out.first;
+         ggml_tensor * new_state = attn_out.second;
+         cb(output, "attn_output", il);
+@@ -564,7 +570,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     const int64_t K = cparams.n_rs_seq + 1;
+ 
+     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
++    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K, fuse_l2_eps);
+     if (n_seq_tokens > 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+     } else {
+diff --git a/src/models/models.h b/src/models/models.h
+index 7a52e7bc..dd3ce84d 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -54,7 +54,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
+                 ggml_tensor * g,
+                 ggml_tensor * b,
+                 ggml_tensor * s,
+-                        int   il);
++                        int   il,
++                float         fuse_l2_eps = 0.0f);
+ 
+     // choose one of two implementations above based on the number of tokens
+     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
+@@ -64,7 +65,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
+                 ggml_tensor * g,
+                 ggml_tensor * b,
+                 ggml_tensor * s,
+-                        int   il);
++                        int   il,
++                float         fuse_l2_eps = 0.0f);
+ 
+     // read conv state from cache, concat with qkv_mixed, write back (single slot or per-token)
+     // qkv_mixed: (qkv_dim, n_seq_tokens, n_seqs); returns conv_input: (kernel_size + n_seq_tokens - 1, channels, n_seqs)
+@@ -87,7 +89,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
+             ggml_tensor *        g,
+             ggml_tensor *        b,
+             ggml_tensor *        s,
+-            int                  il);
++            int                  il,
++            float                fuse_l2_eps = 0.0f);
+ };
+ 
+ struct llm_build_rwkv6_base : public llm_graph_context {
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index d8ffe43a..cbcd4547 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -428,8 +428,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+ 
+     const float eps_norm = hparams.f_norm_rms_eps;
+ 
+-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
++    // Fused GDN on CUDA/HIP applies q/k L2-norm inside the kernel; skip separate ggml_l2_norm nodes.
++    const bool fuse_gdn_l2 = cparams.fused_gdn_ar || cparams.fused_gdn_ch;
++    if (!fuse_gdn_l2) {
++        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
++        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
++    }
+ 
+     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+@@ -447,7 +451,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     cb(k_conv, "k_conv_predelta", il);
+     cb(v_conv, "v_conv_predelta", il);
+ 
+-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
++    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il,
++            fuse_gdn_l2 ? eps_norm : 0.0f);
+ 
+     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
+     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 084344fb..3edae7dd 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3970,7 +3970,7 @@ struct test_gated_delta_net : public test_case {
+         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
+         q = ggml_l2_norm(ctx, q, 1e-6f);
+         k = ggml_l2_norm(ctx, k, 1e-6f);
+-        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
++        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K, 0.0f);
+         return out;
+     }
+ 
+-- 
+2.43.0
+

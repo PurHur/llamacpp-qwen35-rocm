@@ -1,4 +1,5 @@
 # llamacpp-qwen35-rocm: ROCm llama-server fork for Qwen3.5 / Qwythos GDN optimizations.
+# Upstream llama.cpp is cloned at build time; fork changes live in ../patches/*.patch.
 FROM rocm/dev-ubuntu-24.04:7.2-complete
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -9,10 +10,22 @@ ENV ROCM_PATH=/opt/rocm
 ENV CMAKE_PREFIX_PATH=/opt/rocm
 ARG AMDGPU_TARGETS="gfx1100;gfx1151"
 ENV AMDGPU_TARGETS=${AMDGPU_TARGETS}
+ARG LLAMA_CPP_REF=e3546c7948e3af463d0b401e6421d5a4c2faf565
 ARG CACHEBUST=
 
 WORKDIR /src
-COPY llama.cpp /src/llama.cpp
+COPY patches/ /src/patches/
+
+RUN set -eux; \
+  ref="$(tr -d '[:space:]' < /src/patches/UPSTREAM_REF)"; \
+  test -n "$ref"; \
+  git clone --filter=blob:none --no-checkout https://github.com/ggml-org/llama.cpp.git /src/llama.cpp; \
+  cd /src/llama.cpp; \
+  git fetch --depth 1 origin "$ref"; \
+  git checkout "$ref"; \
+  git config user.email "build@local"; \
+  git config user.name "llamacpp-qwen35-rocm"; \
+  git am /src/patches/*.patch
 
 WORKDIR /src/llama.cpp
 RUN set -eux; \

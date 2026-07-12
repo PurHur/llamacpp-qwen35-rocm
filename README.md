@@ -4,8 +4,8 @@ ROCm fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) targeting **Qwen
 
 ## Layout
 
-- `llama.cpp/` — upstream master + fork patches
-- `docker/` — ROCm llama-server image
+- `patches/` — git-am patches applied to upstream [llama.cpp](https://github.com/ggml-org/llama.cpp) at `patches/UPSTREAM_REF` (~110 KiB; no model weights)
+- `docker/` — ROCm llama-server image (clones upstream at build time)
 - `scripts/bench-pp-tps.sh` — PP/TPS benchmark (**exclusive GPU lock**)
 - `scripts/rocprof-benchmark.sh` — rocprof + benchmark (serialized)
 - `bench/profile_one_at_a_time.py` — HTTP timings benchmark

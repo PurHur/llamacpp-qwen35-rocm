@@ -1,6 +1,22 @@
-# Ignore upstream clone artifacts; track fork patches via submodule or subtree later
+# Models and weights — never commit these
+*.gguf
+*.ggml
+*.bin
+*.safetensors
+models/
+**/models/**/*.gguf
+
+# Upstream clone (fetched at Docker build time from patches/)
+llama.cpp/
+
+# Build artifacts
 llama.cpp/build*/
 llama.cpp/.cache/
+build/
+*.o
+*.so
+
+# Profiling scratch (keep summary JSON only)
 var/profiles/*.csv
 var/profiles/*_*/
 *.pid
