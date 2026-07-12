@@ -1,0 +1,299 @@
+From 8c5975ee3c4e5c61fed186aed57017b8fb4a8aca Mon Sep 17 00:00:00 2001
+From: PurHur <PurHur@users.noreply.github.com>
+Date: Sun, 12 Jul 2026 10:02:37 +0200
+Subject: [PATCH] Rewrite GDN decode megafusion v2 with shared conv+silu cache.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+One block per (head, seq) computes conv+silu once in dynamic shared memory,
+then all S_v GDN columns — fixes v1 redundant conv per column block.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ .../ggml-cuda/gated_delta_net_decode_fused.cu | 192 +++++++++---------
+ 1 file changed, 100 insertions(+), 92 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/gated_delta_net_decode_fused.cu b/ggml/src/ggml-cuda/gated_delta_net_decode_fused.cu
+index 5e7c4091..e2d7b7dc 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net_decode_fused.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net_decode_fused.cu
+@@ -4,7 +4,7 @@
+ 
+ #include <cmath>
+ 
+-// MVP: Qwythos decode — conv1d (d_conv=4) + silu + q/k L2 + one GDN step, S_v=128, n_tokens=1, K=1.
++// Decode megafusion v2: one block per (head, seq) — conv+silu computed once in shared mem, then all S_v GDN columns.
+ 
+ bool ggml_cuda_gdn_decode_fused_enabled() {
+     static int enabled = -1;
+@@ -42,9 +42,8 @@ static __device__ __forceinline__ void gdn_decode_l2_normalize(float (& shard)[r
+ }
+ 
+ template<int S_v, int D_CONV, int NUM_WARPS>
+-__global__ void __launch_bounds__(
+-        (ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * NUM_WARPS, 1)
+-gdn_decode_megafuse_cuda(
++__global__ void __launch_bounds__(NUM_WARPS * ggml_cuda_get_physical_warp_size(), 1)
++gdn_decode_megafuse_v2_cuda(
+         const float * conv_input,
+         const float * conv_weight,
+         const float * g,
+@@ -60,106 +59,114 @@ gdn_decode_megafuse_cuda(
+         int           conv_in_stride_col,
+         int           conv_in_stride_seq,
+         int           conv_w_stride_col,
+-        int           sb1,
+-        int           sb2,
+-        int           sb3,
++        int64_t       sb1,
++        int64_t       sb3,
+         float         scale,
+         float         fuse_l2_eps) {
+-    const uint32_t h_idx    = blockIdx.x;
+-    const uint32_t sequence = blockIdx.y;
+-    const int      lane     = threadIdx.x;
+-    const int      col      = blockIdx.z * blockDim.y + threadIdx.y;
++    extern __shared__ float conv_silu_sm[];
++
++    const uint32_t h_idx     = blockIdx.x;
++    const uint32_t sequence  = blockIdx.y;
++    const int      lane      = threadIdx.x;
++    const int      warp_id   = threadIdx.y;
+ 
+     constexpr int warp_sz       = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
+-    static_assert(S_v % warp_sz == 0, "S_v must be a multiple of warp_size");
+     constexpr int rows_per_lane = (S_v + warp_sz - 1) / warp_sz;
+ 
+-    const int64_t iq1 = h_idx % neqk1;
+-
++    const int64_t iq1   = h_idx % neqk1;
+     const int64_t q_base = iq1 * S_v;
+     const int64_t k_base = neqk1 * S_v + iq1 * S_v;
+     const int64_t v_base = 2 * neqk1 * S_v + h_idx * S_v;
+ 
+-    const float * x_seq = conv_input + sequence * conv_in_stride_seq;
++    const float * x_seq = conv_input + (int64_t) sequence * conv_in_stride_seq;
+     const float * w     = conv_weight;
+ 
+-    auto conv_silu_channel = [&](const int64_t channel) -> float {
++    const int n_threads = NUM_WARPS * warp_sz;
++    for (int c = warp_id * warp_sz + lane; c < (int) qkv_dim; c += n_threads) {
+         float sumf = 0.0f;
+ #pragma unroll
+         for (int j = 0; j < D_CONV; j++) {
+-            const float xj = x_seq[j * conv_in_stride_row + channel * conv_in_stride_col];
+-            const float wj = w[j * conv_w_stride_col + channel];
++            const float xj = x_seq[j * conv_in_stride_row + c * conv_in_stride_col];
++            const float wj = w[j * conv_w_stride_col + c];
+             sumf += xj * wj;
+         }
+-        return ggml_cuda_op_silu_single(sumf);
+-    };
+-
+-    float q_reg[rows_per_lane];
+-    float k_reg[rows_per_lane];
+-#pragma unroll
+-    for (int r = 0; r < rows_per_lane; r++) {
+-        const int i = r * warp_sz + lane;
+-        if (i < S_v) {
+-            const int64_t qc = q_base + i;
+-            const int64_t kc = k_base + i;
+-            q_reg[r]           = (qc < qkv_dim) ? conv_silu_channel(qc) : 0.0f;
+-            k_reg[r]           = (kc < qkv_dim) ? conv_silu_channel(kc) : 0.0f;
+-        } else {
+-            q_reg[r] = 0.0f;
+-            k_reg[r] = 0.0f;
+-        }
++        conv_silu_sm[c] = ggml_cuda_op_silu_single(sumf);
+     }
++    __syncthreads();
+ 
+-    if (fuse_l2_eps > 0.0f) {
+-        gdn_decode_l2_normalize<warp_sz, rows_per_lane>(q_reg, fuse_l2_eps);
+-        gdn_decode_l2_normalize<warp_sz, rows_per_lane>(k_reg, fuse_l2_eps);
+-    }
++    const int64_t state_in_base  = (int64_t) sequence * H * S_v * S_v + h_idx * S_v * S_v;
++    const int64_t state_out_base = ((int64_t) sequence * H + h_idx) * S_v * S_v;
++    const int64_t gb_offset      = (int64_t) sequence * sb3 + h_idx * sb1;
++    const float   beta_val       = beta[gb_offset];
++    const float   g_val          = expf(g[gb_offset]);
++
++    float * dst_row = dst + ((int64_t) sequence * H + h_idx) * S_v;
+ 
+-    const int64_t state_in_offset  = sequence * H * S_v * S_v + h_idx * S_v * S_v;
+-    const int64_t state_out_offset = (sequence * H + h_idx) * S_v * S_v;
+-    curr_state += state_in_offset + col * S_v;
+-    state_out  += state_out_offset;
+-    dst        += (sequence * H + h_idx) * S_v + col;
++    for (int col = warp_id; col < S_v; col += NUM_WARPS) {
++        const float * s_col_in = curr_state + state_in_base + (int64_t) col * S_v;
+ 
+-    float s_shard[rows_per_lane];
+-    ggml_cuda_pdl_sync();
++        float q_reg[rows_per_lane];
++        float k_reg[rows_per_lane];
+ #pragma unroll
+-    for (int r = 0; r < rows_per_lane; r++) {
+-        const int i = r * warp_sz + lane;
+-        s_shard[r]  = curr_state[i];
+-    }
++        for (int r = 0; r < rows_per_lane; r++) {
++            const int i = r * warp_sz + lane;
++            if (i < S_v) {
++                const int64_t qc = q_base + i;
++                const int64_t kc = k_base + i;
++                q_reg[r]           = (qc < qkv_dim) ? conv_silu_sm[qc] : 0.0f;
++                k_reg[r]           = (kc < qkv_dim) ? conv_silu_sm[kc] : 0.0f;
++            } else {
++                q_reg[r] = 0.0f;
++                k_reg[r] = 0.0f;
++            }
++        }
+ 
+-    const int64_t gb_offset = sequence * sb3 + h_idx * sb1;
+-    const float   beta_val  = beta[gb_offset];
+-    const float   g_val     = expf(g[gb_offset]);
++        if (fuse_l2_eps > 0.0f) {
++            gdn_decode_l2_normalize<warp_sz, rows_per_lane>(q_reg, fuse_l2_eps);
++            gdn_decode_l2_normalize<warp_sz, rows_per_lane>(k_reg, fuse_l2_eps);
++        }
+ 
+-    const int64_t vc = v_base + col;
+-    const float   v_col = (vc < qkv_dim) ? conv_silu_channel(vc) : 0.0f;
++        float s_shard[rows_per_lane];
++#pragma unroll
++        for (int r = 0; r < rows_per_lane; r++) {
++            const int i = r * warp_sz + lane;
++            s_shard[r]  = (i < S_v) ? s_col_in[i] : 0.0f;
++        }
++
++        const int64_t vc    = v_base + col;
++        const float   v_col = (vc < qkv_dim) ? conv_silu_sm[vc] : 0.0f;
+ 
+-    float kv_shard = 0.0f;
++        float kv_shard = 0.0f;
+ #pragma unroll
+-    for (int r = 0; r < rows_per_lane; r++) {
+-        kv_shard += s_shard[r] * k_reg[r];
+-    }
+-    const float kv_col    = warp_reduce_sum<warp_sz>(kv_shard);
+-    const float delta_col = (v_col - g_val * kv_col) * beta_val;
++        for (int r = 0; r < rows_per_lane; r++) {
++            kv_shard += s_shard[r] * k_reg[r];
++        }
++        const float kv_col    = warp_reduce_sum<warp_sz>(kv_shard);
++        const float delta_col = (v_col - g_val * kv_col) * beta_val;
+ 
+-    float attn_partial = 0.0f;
++        float attn_partial = 0.0f;
+ #pragma unroll
+-    for (int r = 0; r < rows_per_lane; r++) {
+-        s_shard[r]    = g_val * s_shard[r] + k_reg[r] * delta_col;
+-        attn_partial += s_shard[r] * q_reg[r];
+-    }
+-    const float attn_col = warp_reduce_sum<warp_sz>(attn_partial);
++        for (int r = 0; r < rows_per_lane; r++) {
++            const int i = r * warp_sz + lane;
++            if (i < S_v) {
++                s_shard[r]     = g_val * s_shard[r] + k_reg[r] * delta_col;
++                attn_partial  += s_shard[r] * q_reg[r];
++            }
++        }
++        const float attn_col = warp_reduce_sum<warp_sz>(attn_partial);
+ 
+-    if (lane == 0) {
+-        dst[0] = attn_col * scale;
+-    }
++        if (lane == 0) {
++            dst_row[col] = attn_col * scale;
++        }
+ 
++        float * s_col_out = state_out + state_out_base + (int64_t) col * S_v;
+ #pragma unroll
+-    for (int r = 0; r < rows_per_lane; r++) {
+-        const int i              = r * warp_sz + lane;
+-        state_out[col * S_v + i] = s_shard[r];
++        for (int r = 0; r < rows_per_lane; r++) {
++            const int i = r * warp_sz + lane;
++            if (i < S_v) {
++                s_col_out[i] = s_shard[r];
++            }
++        }
+     }
+ }
+ 
+@@ -187,21 +194,23 @@ static void launch_gdn_decode_megafuse(
+         float         scale,
+         float         fuse_l2_eps,
+         cudaStream_t  stream) {
+-    if (S_v != 128 || d_conv != 4) {
++    GGML_UNUSED(sb2);
++
++    if (S_v != 128 || d_conv != 4 || qkv_dim <= 0 || qkv_dim > 8192) {
+         return;
+     }
+ 
+-    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+-    const int num_warps = 8;
+-    const int block_x   = warp_size <= S_v ? warp_size : S_v;
+-    dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
+-    dim3      block_dims(block_x, num_warps, 1);
++    constexpr int num_warps = 8;
++    const int     warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
++    dim3          grid_dims((unsigned) H, (unsigned) n_seqs, 1);
++    dim3          block_dims(warp_size, num_warps, 1);
++    const size_t  shmem     = (size_t) qkv_dim * sizeof(float);
+ 
+-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, shmem, stream);
+ 
+-    ggml_cuda_kernel_launch(gdn_decode_megafuse_cuda<128, 4, 8>, launch_params, conv_input, conv_weight, g_d, b_d, s_d,
+-        dst_d, state_d, H, n_seqs, neqk1, qkv_dim, conv_in_stride_row, conv_in_stride_col, conv_in_stride_seq,
+-        conv_w_stride_col, (int) sb1, (int) sb2, (int) sb3, scale, fuse_l2_eps);
++    ggml_cuda_kernel_launch(gdn_decode_megafuse_v2_cuda<128, 4, num_warps>, launch_params, conv_input, conv_weight, g_d,
++        b_d, s_d, dst_d, state_d, H, n_seqs, neqk1, qkv_dim, conv_in_stride_row, conv_in_stride_col,
++        conv_in_stride_seq, conv_w_stride_col, sb1, sb3, scale, fuse_l2_eps);
+ }
+ 
+ int ggml_cuda_try_gdn_decode_megafusion(const ggml_cgraph * cgraph, int node_idx,
+@@ -286,18 +295,17 @@ int ggml_cuda_try_gdn_decode_megafusion(const ggml_cgraph * cgraph, int node_idx
+         }
+     }
+ 
+-    const int64_t n_t_conv = silu->ne[1];
+-    if (n_t_conv != 1) {
++    if (silu->ne[1] != 1) {
+         return 0;
+     }
+ 
+     GGML_UNUSED(H);
+     GGML_UNUSED(silu_idx);
+ 
+-    args.ssm_conv      = ssm;
+-    args.silu          = silu;
+-    args.gdn           = gdn;
+-    args.gdn_node_idx  = gdn_idx;
++    args.ssm_conv     = ssm;
++    args.silu         = silu;
++    args.gdn          = gdn;
++    args.gdn_node_idx = gdn_idx;
+     return gdn_idx - node_idx;
+ }
+ 
+@@ -338,9 +346,9 @@ void ggml_cuda_op_gdn_decode_megafused(ggml_backend_cuda_context & ctx,
+     const int64_t sb2 = src_beta->nb[2] / sizeof(float);
+     const int64_t sb3 = src_beta->nb[3] / sizeof(float);
+ 
+-    const float scale      = 1.0f / sqrtf((float) S_v);
+-    const float fuse_l2    = ggml_get_op_params_f32(gdn, 1);
+-    float *     state_d    = dst_d + S_v * H * n_seqs;
++    const float scale   = 1.0f / sqrtf((float) S_v);
++    const float fuse_l2 = ggml_get_op_params_f32(gdn, 1);
++    float *     state_d = dst_d + S_v * H * n_seqs;
+ 
+     launch_gdn_decode_megafuse(conv_input, conv_weight, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_seqs, neqk1, qkv_dim,
+         d_conv, conv_in_stride_row, conv_in_stride_col, conv_in_stride_seq, conv_w_stride_col, sb1, sb2, sb3, scale,
+-- 
+2.43.0
+

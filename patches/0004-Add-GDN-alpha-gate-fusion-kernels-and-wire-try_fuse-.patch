@@ -1,0 +1,291 @@
+From 18d396ba068cf69b9a217738689592a793e9276d Mon Sep 17 00:00:00 2001
+From: PurHur <PurHur@users.noreply.github.com>
+Date: Sun, 12 Jul 2026 09:36:34 +0200
+Subject: [PATCH] Add GDN alpha gate fusion kernels and wire try_fuse dispatch.
+
+Implement ADD+SOFTPLUS(+MUL) for Qwen35 ssm_dt/ssm_a path; complete Phase 2
+micro-fusion alongside existing ssm_conv+silu span matcher from megafusion prep.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ docs/FUSION_ALPHA_BETA.md       | 63 ++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 10 ++++
+ ggml/src/ggml-cuda/unary.cu     | 96 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/unary.cuh    |  4 ++
+ tests/test-backend-ops.cpp      | 40 ++++++++++++++
+ 5 files changed, 213 insertions(+)
+ create mode 100644 docs/FUSION_ALPHA_BETA.md
+
+diff --git a/docs/FUSION_ALPHA_BETA.md b/docs/FUSION_ALPHA_BETA.md
+new file mode 100644
+index 00000000..a2f623db
+--- /dev/null
++++ b/docs/FUSION_ALPHA_BETA.md
+@@ -0,0 +1,63 @@
++# Phase 2: GDN graph-level fusion (alpha / beta / conv)
++
++Track B follow-on for Qwen3.5 linear-attention decode on HIP/CUDA (`ggml-cuda.cu`).
++
++## Implemented fusions
++
++### B2 — `SSM_CONV + SILU` (verified + hardened)
++
++**Graph:** `build_layer_attn_linear()` → `ggml_ssm_conv` → `ggml_silu`.
++
++**Matcher:** Existing `ggml_cuda_can_fuse({ SSM_CONV, UNARY(SILU) })` plus new
++`ggml_cuda_ssm_conv_silu_span()` that skips view/noop nodes between conv and silu
++(same pattern as `ggml_cuda_try_gdn_decode_megafusion`).
++
++**Kernel:** `ggml_cuda_op_ssm_conv(..., silu_dst)` in `ssm-conv.cu`.
++
++### B3 — GDN alpha gate: `ADD + SOFTPLUS (+ MUL)`
++
++**Graph:** `alpha + ssm_dt` → `softplus` → `mul(ssm_a)` in `qwen35.cpp`.
++
++**Matcher:** `ggml_cuda_can_fuse({ ADD, UNARY(SOFTPLUS), MUL })` with 1-D channel-wise
++`ssm_dt` / `ssm_a` broadcast (ne[0] == num_v_heads).
++
++**Kernel:** `ggml_cuda_op_add_softplus_mul` in `unary.cu` — one launch for
++`softplus(x + bias) * gate`.
++
++Fallback: `ADD + SOFTPLUS` only when the downstream mul is not fuseable.
++
++### B4 — GDN beta: `MUL_MAT + SIGMOID` (not fused)
++
++Beta path is `mul_mat → reshape → sigmoid`. Reshape is a graph no-op at runtime;
++fusing sigmoid into the quantized matmul epilogue is deferred (needs mm kernel hook).
++
++Separate `UNARY(SIGMOID)` still runs as a single kernel after matmul.
++
++### Megafusion (optional, env-gated)
++
++`GGML_CUDA_GDN_DECODE_FUSED=1` enables `gated_delta_net_decode_fused.cu` megafusion:
++conv + silu + L2 + one GDN step (Qwythos decode, S_v=128, d_conv=4, n_tokens=1).
++Default off; Phase 2 micro-fusions above apply when megafusion is disabled.
++
++## Tests
++
++```bash
++./build-rocm/bin/test-backend-ops test -b ROCm0 -o ADD_SOFTPLUS_MUL
++./build-rocm/bin/test-backend-ops test -b ROCm0 -o SSM_CONV_BIAS_SILU
++```
++
++## Benchmark
++
++```bash
++/home/ai/projects/llamacpp-qwen35-rocm/scripts/bench-pp-tps.sh \
++  --url http://127.0.0.1:50127 --title fusion-v1
++```
++
++## Files
++
++| File | Change |
++|------|--------|
++| `ggml/src/ggml-cuda/unary.cu` | `add_softplus` / `add_softplus_mul` kernels |
++| `ggml/src/ggml-cuda/unary.cuh` | declarations |
++| `ggml/src/ggml-cuda/ggml-cuda.cu` | `can_fuse` + `try_fuse` patterns, `ssm_conv_silu_span` |
++| `tests/test-backend-ops.cpp` | `test_add_softplus_mul` |
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 15644e8e..6e470148 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3835,6 +3835,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 1;
+     }
+ 
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
++        ggml_cuda_op_add_softplus_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
++        return 2;
++    }
++
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SOFTPLUS })) {
++        ggml_cuda_op_add_softplus(*cuda_ctx, node, cgraph->nodes[i + 1]);
++        return 1;
++    }
++
+     if (node->op == GGML_OP_SSM_CONV) {
+         ggml_cuda_gdn_decode_megafuse_args megafuse_args;
+         const int megafuse_skip = ggml_cuda_try_gdn_decode_megafusion(cgraph, i, megafuse_args);
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 4cb805fa..c900f4f5 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -627,6 +627,102 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
+     }
+ }
+ 
++/* fused add + softplus (+ optional channel-wise mul gate) */
++
++template <typename T>
++static __global__ void add_softplus_kernel(const T * x, const T * bias, T * dst, const int64_t k, const int64_t nc) {
++    ggml_cuda_pdl_lc();
++    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
++
++    if (i >= k) {
++        return;
++    }
++
++    const int64_t c  = i % nc;
++    const float sp = op_softplus((float) x[i] + (float) bias[c]);
++
++    ggml_cuda_pdl_sync();
++    dst[i] = (T) sp;
++}
++
++template <typename T>
++static __global__ void add_softplus_mul_kernel(const T * x, const T * bias, const T * gate, T * dst,
++        const int64_t k, const int64_t nc) {
++    ggml_cuda_pdl_lc();
++    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
++
++    if (i >= k) {
++        return;
++    }
++
++    const int64_t c  = i % nc;
++    const float sp = op_softplus((float) x[i] + (float) bias[c]);
++
++    ggml_cuda_pdl_sync();
++    dst[i] = (T) (sp * (float) gate[c]);
++}
++
++template <typename T>
++static void add_softplus_cuda(const T * x, const T * bias, T * dst, const int64_t k, const int64_t nc, cudaStream_t stream) {
++    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
++    ggml_cuda_kernel_launch(add_softplus_kernel<T>, launch_params, x, bias, dst, k, nc);
++}
++
++template <typename T>
++static void add_softplus_mul_cuda(const T * x, const T * bias, const T * gate, T * dst,
++        const int64_t k, const int64_t nc, cudaStream_t stream) {
++    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
++    ggml_cuda_kernel_launch(add_softplus_mul_kernel<T>, launch_params, x, bias, gate, dst, k, nc);
++}
++
++static void ggml_cuda_op_add_softplus_impl(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * softplus_node, ggml_tensor * mul_node) {
++    const ggml_tensor * bias = (ggml_nelements(add_node->src[0]) < ggml_nelements(add_node->src[1])) ? add_node->src[0] : add_node->src[1];
++    const ggml_tensor * x    = (bias == add_node->src[0]) ? add_node->src[1] : add_node->src[0];
++
++    const ggml_tensor * gate = mul_node ? ((mul_node->src[0] == softplus_node) ? mul_node->src[1] : mul_node->src[0]) : nullptr;
++    const ggml_tensor * out = mul_node ? mul_node : softplus_node;
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(bias->type == GGML_TYPE_F32);
++    GGML_ASSERT(out->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x));
++    GGML_ASSERT(ggml_is_contiguous(bias));
++    GGML_ASSERT(ggml_is_contiguous(out));
++    GGML_ASSERT(ggml_nelements(bias) == out->ne[0]);
++    GGML_ASSERT(bias->ne[0] == out->ne[0]);
++    GGML_ASSERT(ggml_are_same_shape(x, out));
++
++    if (mul_node) {
++        GGML_ASSERT(gate->type == GGML_TYPE_F32);
++        GGML_ASSERT(ggml_is_contiguous(gate));
++        GGML_ASSERT(ggml_nelements(gate) == out->ne[0]);
++        GGML_ASSERT(gate->ne[0] == out->ne[0]);
++    }
++
++    const int64_t k  = ggml_nelements(out);
++    const int64_t nc = out->ne[0];
++
++    cudaStream_t stream = ctx.stream();
++
++    if (mul_node) {
++        add_softplus_mul_cuda((const float *) x->data, (const float *) bias->data, (const float *) gate->data,
++                (float *) out->data, k, nc, stream);
++    } else {
++        add_softplus_cuda((const float *) x->data, (const float *) bias->data,
++                (float *) out->data, k, nc, stream);
++    }
++}
++
++void ggml_cuda_op_add_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * softplus_node) {
++    ggml_cuda_op_add_softplus_impl(ctx, add_node, softplus_node, nullptr);
++}
++
++void ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * softplus_node, ggml_tensor * mul_node) {
++    ggml_cuda_op_add_softplus_impl(ctx, add_node, softplus_node, mul_node);
++}
++
+ /* fused relu + sqr */
+ 
+ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index 81ed873e..7d2bd7ad 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -91,6 +91,10 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
+ 
++void ggml_cuda_op_add_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * softplus_node);
++
++void ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * softplus_node, ggml_tensor * mul_node);
++
+ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
+ 
+ __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 3edae7dd..c8120c80 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3815,6 +3815,44 @@ struct test_ssm_conv_bias_silu : public test_case {
+     }
+ };
+ 
++// GDN alpha gate: ADD(channel bias) + SOFTPLUS + MUL(channel gate)
++struct test_add_softplus_mul : public test_case {
++    const int64_t n_heads;
++    const int64_t n_tokens;
++    const int64_t n_seqs;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "ADD_SOFTPLUS_MUL";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR3(n_heads, n_tokens, n_seqs);
++    }
++
++    test_add_softplus_mul(int64_t n_heads = 32, int64_t n_tokens = 1, int64_t n_seqs = 1)
++        : n_heads(n_heads), n_tokens(n_tokens), n_seqs(n_seqs) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * alpha = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_heads, n_tokens, n_seqs);
++        ggml_tensor * dt    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_heads);
++        ggml_tensor * a     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_heads);
++
++        ggml_set_name(alpha, "alpha");
++        ggml_set_name(dt, "dt");
++        ggml_set_name(a, "a");
++
++        ggml_tensor * out = ggml_add(ctx, alpha, dt);
++        out               = ggml_softplus(ctx, out);
++        out               = ggml_mul(ctx, out, a);
++
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_SSM_SCAN
+ struct test_ssm_scan : public test_case {
+     const ggml_type type;
+@@ -9768,6 +9806,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1})); // generate
+     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1}, true));  // prefill
+     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
++    test_cases.emplace_back(new test_add_softplus_mul(32, 1, 1));   // GDN decode alpha gate
++    test_cases.emplace_back(new test_add_softplus_mul(32, 4, 2));   // GDN prefill alpha gate
+     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
+     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
+ 
+-- 
+2.43.0
+

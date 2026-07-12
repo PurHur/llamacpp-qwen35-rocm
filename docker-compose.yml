@@ -18,9 +18,10 @@ services:
       - LLAMACPP_N_CTX=${QWEN35_ROCM_FORK_N_CTX:-16384}
       - LLAMACPP_N_BATCH=${QWEN35_ROCM_FORK_N_BATCH:-2048}
       - LLAMACPP_FLASH_ATTN=on
-      - LLAMACPP_EXTRA_ARGS=${QWEN35_ROCM_FORK_EXTRA_ARGS:---jinja --spec-type draft-mtp --spec-draft-n-max 6 --ubatch-size 256 --parallel 1}
+      - LLAMACPP_EXTRA_ARGS=${QWEN35_ROCM_FORK_EXTRA_ARGS:---jinja --spec-type draft-mtp --spec-draft-n-max 3 --ubatch-size 256 --parallel 1}
       - GGML_CUDA_GDN_CHUNKED=${QWEN35_ROCM_FORK_GDN_CHUNKED:-1}
       - GGML_CUDA_GDN_CHUNK_THRESHOLD=${QWEN35_ROCM_FORK_GDN_CHUNK_THRESHOLD:-16}
+      - GGML_CUDA_GDN_DECODE_FUSED=${QWEN35_ROCM_FORK_GDN_DECODE_FUSED:-1}
       - HSA_OVERRIDE_GFX_VERSION=${QWEN35_ROCM_FORK_HSA_OVERRIDE:-11.5.1}
       - ROCM_PATH=/opt/rocm
       - LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64

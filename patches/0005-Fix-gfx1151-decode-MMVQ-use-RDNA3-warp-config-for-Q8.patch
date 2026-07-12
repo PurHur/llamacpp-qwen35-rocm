@@ -1,0 +1,44 @@
+From 927331597f2dbe8ce49636256149028a09373654 Mon Sep 17 00:00:00 2001
+From: PurHur <PurHur@users.noreply.github.com>
+Date: Sun, 12 Jul 2026 09:53:01 +0200
+Subject: [PATCH] Fix gfx1151 decode MMVQ: use RDNA3 warp config for Q8_0.
+
+RDNA3_5 was mapped to MMVQ_PARAMETERS_RDNA2 but calc_nwarps has no RDNA2
+branch, forcing 1 warp on all decode mat-vec (mul_mat_vec_q) kernels.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ ggml/src/ggml-cuda/mmvq.cu | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index e18ada53..03454628 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -75,7 +75,10 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+     return MMVQ_PARAMETERS_RDNA4;
+ #elif defined(RDNA3_0)
+     return MMVQ_PARAMETERS_RDNA3_0;
+-#elif defined(RDNA2) || defined(RDNA3_5)
++#elif defined(RDNA3_5)
++    // gfx1151 (Strix Halo): same MMVQ tuning as RDNA3 — RDNA2 table has no calc_nwarps branch (falls back to 1 warp).
++    return MMVQ_PARAMETERS_RDNA3_0;
++#elif defined(RDNA2)
+     return MMVQ_PARAMETERS_RDNA2;
+ #elif defined(GCN) || defined(CDNA)
+     return MMVQ_PARAMETERS_GCN;
+@@ -93,7 +96,10 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+     if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+         return MMVQ_PARAMETERS_RDNA3_0;
+     }
+-    if (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) {
++    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
++        return MMVQ_PARAMETERS_RDNA3_0;
++    }
++    if (GGML_CUDA_CC_IS_RDNA2(cc)) {
+         return MMVQ_PARAMETERS_RDNA2;
+     }
+     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
+-- 
+2.43.0
+
