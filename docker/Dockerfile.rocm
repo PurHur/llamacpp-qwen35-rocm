@@ -1,0 +1,42 @@
+# llamacpp-qwen35-rocm: ROCm llama-server fork for Qwen3.5 / Qwythos GDN optimizations.
+FROM rocm/dev-ubuntu-24.04:7.2-complete
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git rocm-dev rocm-libs hipblas rocblas \
+    && ldconfig && rm -rf /var/lib/apt/lists/*
+
+ENV ROCM_PATH=/opt/rocm
+ENV CMAKE_PREFIX_PATH=/opt/rocm
+ARG AMDGPU_TARGETS="gfx1100;gfx1151"
+ENV AMDGPU_TARGETS=${AMDGPU_TARGETS}
+ARG CACHEBUST=
+
+WORKDIR /src
+COPY llama.cpp /src/llama.cpp
+
+WORKDIR /src/llama.cpp
+RUN set -eux; \
+  echo "llamacpp-qwen35-rocm build CACHEBUST=${CACHEBUST}"; \
+  cmake -B build \
+    -DGGML_HIP=on \
+    -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLAMA_BUILD_SERVER=ON \
+    -DLLAMA_BUILD_TOOLS=ON \
+    -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DLLAMA_BUILD_TESTS=ON \
+    -DLLAMA_BUILD_UI=OFF \
+    -DCMAKE_CXX_FLAGS="-DGGML_CUDA_GDN_CHUNKED=1" \
+    -DCMAKE_CUDA_FLAGS="-DGGML_CUDA_GDN_CHUNKED=1" \
+    -DCMAKE_HIP_FLAGS="-DGGML_CUDA_GDN_CHUNKED=1" \
+    -DCMAKE_PREFIX_PATH=/opt/rocm; \
+  cmake --build build -j"$(nproc)"
+
+RUN mkdir -p /app/models /app/build/bin && \
+    cp -a /src/llama.cpp/build/bin/. /app/build/bin/ && \
+    (test -f /app/build/bin/llama-server || mv /app/build/bin/server /app/build/bin/llama-server 2>/dev/null || true)
+
+WORKDIR /app
+COPY docker/entrypoint-llama-server.sh /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]

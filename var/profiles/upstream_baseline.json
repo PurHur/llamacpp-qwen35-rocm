@@ -1,0 +1,39 @@
+{
+  "title": "upstream-rocm-baseline",
+  "url": "http://127.0.0.1:50126",
+  "model": "Qwythos-9B-v2-MTP-Q8_0.gguf",
+  "pp_mean": 79.01121082960479,
+  "pp_stdev": 3.6790602114062714,
+  "decode_mean": 23.62639037558896,
+  "decode_stdev": 2.1028227015259744,
+  "runs": [
+    {
+      "prompt_tokens": 70,
+      "completion_tokens": 128,
+      "pp_tok_s": 83.22271647268838,
+      "decode_tok_s": 24.02447944302247,
+      "draft_n": 247,
+      "draft_n_accepted": 84,
+      "wall_s": 5.913512641040143
+    },
+    {
+      "prompt_tokens": 70,
+      "completion_tokens": 128,
+      "pp_tok_s": 79.55133049600255,
+      "decode_tok_s": 20.875103927031073,
+      "draft_n": 295,
+      "draft_n_accepted": 77,
+      "wall_s": 6.744855238008313
+    },
+    {
+      "prompt_tokens": 70,
+      "completion_tokens": 128,
+      "pp_tok_s": 74.25958552012344,
+      "decode_tok_s": 25.97958775671334,
+      "draft_n": 229,
+      "draft_n_accepted": 88,
+      "wall_s": 5.592335125023965
+    }
+  ],
+  "ts": "2026-07-12T06:37:24Z"
+}

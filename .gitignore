@@ -1,0 +1,6 @@
+# Ignore upstream clone artifacts; track fork patches via submodule or subtree later
+llama.cpp/build*/
+llama.cpp/.cache/
+var/profiles/*.csv
+var/profiles/*_*/
+*.pid

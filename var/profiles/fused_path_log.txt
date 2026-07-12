@@ -1,0 +1,12 @@
+=== rg filter: fused.*gated|Gated Delta|draft-mtp|ROCm0|fgdn ===
+0.02.917.966 W llama_sampler_backend_support: device 'ROCm0' does not have support for op TOP_K needed for sampler 'top-k'
+
+=== process args (draft-mtp / ROCm) ===
+/app/build/bin/llama-server --model /app/models/huggingface/empero-ai--Qwythos-9B-v2-GGUF/Qwythos-9B-v2-MTP-Q8_0.gguf --host 0.0.0.0 --port 8000 -ngl -1 -c 16384 -b 2048 -t 8 -ncmoe 0 --flash-attn on -ctk f16 -ctv f16 --threads-batch 16 --poll 0 --no-escape --jinja --spec-type draft-mtp --spec-draft-n-max 6 --ubatch-size 256 --parallel 1 
+
+=== recent draft acceptance (last 5) ===
+5.58.030.472 I slot print_timing: id  0 | task 453 | draft acceptance = 0.26102 (   77 accepted /   295 generated), mean len =  2.54
+6.03.622.944 I slot print_timing: id  0 | task 506 | draft acceptance = 0.38428 (   88 accepted /   229 generated), mean len =  3.26
+6.10.538.003 I slot print_timing: id  0 | task 548 | draft acceptance = 0.37179 (   87 accepted /   234 generated), mean len =  3.23
+6.16.232.850 I slot print_timing: id  0 | task 591 | draft acceptance = 0.35833 (   86 accepted /   240 generated), mean len =  3.10
+6.21.921.587 I slot print_timing: id  0 | task 635 | draft acceptance = 0.35391 (   86 accepted /   243 generated), mean len =  3.10

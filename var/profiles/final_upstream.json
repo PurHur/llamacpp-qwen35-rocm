@@ -1,0 +1,39 @@
+{
+  "title": "upstream-50126",
+  "url": "http://127.0.0.1:50126",
+  "model": "Qwythos-9B-v2-MTP-Q8_0.gguf",
+  "pp_mean": 98.58090755029258,
+  "pp_stdev": 3.2258549807843075,
+  "decode_mean": 23.706714286453984,
+  "decode_stdev": 1.4601009930632896,
+  "runs": [
+    {
+      "prompt_tokens": 70,
+      "completion_tokens": 128,
+      "pp_tok_s": 99.74987718296373,
+      "decode_tok_s": 23.09535494673634,
+      "draft_n": 264,
+      "draft_n_accepted": 81,
+      "wall_s": 6.06479378399672
+    },
+    {
+      "prompt_tokens": 70,
+      "completion_tokens": 128,
+      "pp_tok_s": 94.17747745626633,
+      "decode_tok_s": 22.3043183774166,
+      "draft_n": 271,
+      "draft_n_accepted": 80,
+      "wall_s": 6.301378039992414
+    },
+    {
+      "prompt_tokens": 70,
+      "completion_tokens": 128,
+      "pp_tok_s": 101.81536801164768,
+      "decode_tok_s": 25.720469535209013,
+      "draft_n": 238,
+      "draft_n_accepted": 87,
+      "wall_s": 5.530975011002738
+    }
+  ],
+  "ts": "2026-07-12T07:03:53Z"
+}

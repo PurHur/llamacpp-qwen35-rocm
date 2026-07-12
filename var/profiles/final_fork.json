@@ -1,0 +1,39 @@
+{
+  "title": "fork-50127",
+  "url": "http://127.0.0.1:50127",
+  "model": "/app/models/huggingface/empero-ai--Qwythos-9B-v2-GGUF/Qwythos-9B-v2-MTP-Q8_0.gguf",
+  "pp_mean": 100.53273365964704,
+  "pp_stdev": 3.9957075501683588,
+  "decode_mean": 24.313536178033978,
+  "decode_stdev": 1.453308465055351,
+  "runs": [
+    {
+      "prompt_tokens": 70,
+      "completion_tokens": 128,
+      "pp_tok_s": 97.62740987159555,
+      "decode_tok_s": 22.406774688327015,
+      "draft_n": 267,
+      "draft_n_accepted": 81,
+      "wall_s": 6.184399886988103
+    },
+    {
+      "prompt_tokens": 70,
+      "completion_tokens": 128,
+      "pp_tok_s": 97.78803465607949,
+      "decode_tok_s": 25.93126149306936,
+      "draft_n": 234,
+      "draft_n_accepted": 87,
+      "wall_s": 5.414886553015094
+    },
+    {
+      "prompt_tokens": 70,
+      "completion_tokens": 128,
+      "pp_tok_s": 106.18275645126609,
+      "decode_tok_s": 24.602572352705554,
+      "draft_n": 243,
+      "draft_n_accepted": 85,
+      "wall_s": 5.668461319000926
+    }
+  ],
+  "ts": "2026-07-12T07:04:16Z"
+}

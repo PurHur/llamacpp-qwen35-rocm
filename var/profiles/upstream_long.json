@@ -1,0 +1,30 @@
+{
+  "title": "upstream-long-prefill",
+  "url": "http://127.0.0.1:50126",
+  "model": "Qwythos-9B-v2-MTP-Q8_0.gguf",
+  "pp_mean": 136.35383502742627,
+  "pp_stdev": 0.8846379727099674,
+  "decode_mean": 27.455089135495832,
+  "decode_stdev": 3.4217503884025984,
+  "runs": [
+    {
+      "prompt_tokens": 163,
+      "completion_tokens": 128,
+      "pp_tok_s": 135.4691970547163,
+      "decode_tok_s": 30.87683952389843,
+      "draft_n": 194,
+      "draft_n_accepted": 93,
+      "wall_s": 5.158118067018222
+    },
+    {
+      "prompt_tokens": 163,
+      "completion_tokens": 128,
+      "pp_tok_s": 137.23847300013622,
+      "decode_tok_s": 24.033338747093232,
+      "draft_n": 250,
+      "draft_n_accepted": 84,
+      "wall_s": 6.318804802023806
+    }
+  ],
+  "ts": "2026-07-12T07:04:39Z"
+}

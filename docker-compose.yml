@@ -1,0 +1,33 @@
+# A/B fork backend on port 50127 (production ROCm upstream stays on 50126 via prompt-router).
+services:
+  llamacpp-qwen35-rocm-fork:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.rocm
+      args:
+        CACHEBUST: ${QWEN35_ROCM_FORK_CACHEBUST:-}
+        AMDGPU_TARGETS: "${QWEN35_ROCM_FORK_AMDGPU_TARGETS:-gfx1100;gfx1151}"
+    image: llamacpp-qwen35-rocm:latest
+    container_name: llamacpp-qwen35-rocm-fork
+    ports:
+      - "0.0.0.0:50127:8000"
+    volumes:
+      - ${QWEN35_ROCM_FORK_MODELS_PATH:-/home/ai/projects/prompt-router/models}:/app/models:ro
+    environment:
+      - LLAMACPP_MODEL=/app/models/huggingface/empero-ai--Qwythos-9B-v2-GGUF/Qwythos-9B-v2-MTP-Q8_0.gguf
+      - LLAMACPP_N_CTX=${QWEN35_ROCM_FORK_N_CTX:-16384}
+      - LLAMACPP_N_BATCH=${QWEN35_ROCM_FORK_N_BATCH:-2048}
+      - LLAMACPP_FLASH_ATTN=on
+      - LLAMACPP_EXTRA_ARGS=${QWEN35_ROCM_FORK_EXTRA_ARGS:---jinja --spec-type draft-mtp --spec-draft-n-max 6 --ubatch-size 256 --parallel 1}
+      - GGML_CUDA_GDN_CHUNKED=${QWEN35_ROCM_FORK_GDN_CHUNKED:-1}
+      - GGML_CUDA_GDN_CHUNK_THRESHOLD=${QWEN35_ROCM_FORK_GDN_CHUNK_THRESHOLD:-64}
+      - HSA_OVERRIDE_GFX_VERSION=${QWEN35_ROCM_FORK_HSA_OVERRIDE:-11.5.1}
+      - ROCM_PATH=/opt/rocm
+      - LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "992"
+      - "44"
+    restart: unless-stopped

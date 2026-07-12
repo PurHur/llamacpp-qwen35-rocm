@@ -1,0 +1,30 @@
+{
+  "title": "fork-long-prefill",
+  "url": "http://127.0.0.1:50127",
+  "model": "/app/models/huggingface/empero-ai--Qwythos-9B-v2-GGUF/Qwythos-9B-v2-MTP-Q8_0.gguf",
+  "pp_mean": 138.95370765303716,
+  "pp_stdev": 8.258774194446303,
+  "decode_mean": 26.610366750791158,
+  "decode_stdev": 1.0966642979675907,
+  "runs": [
+    {
+      "prompt_tokens": 163,
+      "completion_tokens": 128,
+      "pp_tok_s": 130.69493345859084,
+      "decode_tok_s": 27.70703104875875,
+      "draft_n": 211,
+      "draft_n_accepted": 90,
+      "wall_s": 5.657410704006907
+    },
+    {
+      "prompt_tokens": 163,
+      "completion_tokens": 128,
+      "pp_tok_s": 147.21248184748345,
+      "decode_tok_s": 25.51370245282357,
+      "draft_n": 234,
+      "draft_n_accepted": 87,
+      "wall_s": 5.939895707007963
+    }
+  ],
+  "ts": "2026-07-12T07:04:57Z"
+}
